@@ -1,0 +1,3 @@
+Welcome to the Datazoic Sandbox Storage.
+This directory is managed via the Filesystem MCP Server.
+Files created or processed by agent tools are securely contained here.

@@ -1,0 +1,59 @@
+[
+  {
+    "id": "tc_01",
+    "query": "Send an invoice for $50 to client@example.com",
+    "expected_domain": "invoicing",
+    "expected_tools": ["paypal_create_draft_invoice", "paypal_send_invoice"],
+    "scenario": "PayPal Invoicing Multi-step"
+  },
+  {
+    "id": "tc_02",
+    "query": "What was my total sales volume last month?",
+    "expected_domain": "reporting",
+    "expected_tools": ["paypal_get_transaction_report", "paypal_list_transactions"],
+    "scenario": "PayPal Reporting"
+  },
+  {
+    "id": "tc_03",
+    "query": "Is there a dispute open from user_123?",
+    "expected_domain": "disputes",
+    "expected_tools": ["paypal_list_disputes"],
+    "scenario": "PayPal Disputes"
+  },
+  {
+    "id": "tc_04",
+    "query": "What are the valid refund reason codes for PayPal?",
+    "expected_domain": "general",
+    "expected_tools": ["rag_pipeline_tool"],
+    "scenario": "Meta-Tool 1 (RAG Documentation)"
+  },
+  {
+    "id": "tc_05",
+    "query": "What tools are available for managing invoices?",
+    "expected_domain": "general",
+    "expected_tools": ["system_search_tool"],
+    "scenario": "Meta-Tool 2 (System Capabilities)"
+  },
+  {
+    "id": "tc_06",
+    "query": "What was the status of my last request?",
+    "expected_domain": "general",
+    "expected_tools": ["system_search_tool"],
+    "scenario": "Meta-Tool 2 (System Execution Logs)"
+  },
+  {
+    "id": "tc_07",
+    "query": "Create a capture order for 100 dollars",
+    "expected_domain": "orders",
+    "expected_tools": ["paypal_create_order"],
+    "scenario": "PayPal Orders"
+  },
+  {
+    "id": "tc_08",
+    "query": "Refund captured payment CAP-123 for $50",
+    "expected_domain": "payments",
+    "expected_tools": ["paypal_refund_captured_payment"],
+    "scenario": "PayPal Payments"
+  }
+]
+
