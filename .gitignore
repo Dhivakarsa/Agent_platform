@@ -47,6 +47,10 @@ venv.bak/
 *.sqlite3
 *.db
 *.db-journal
+# LangGraph checkpoint store (pending human-approval state)
+*.checkpoints
+*.checkpoints-shm
+*.checkpoints-wal
 qdrant_storage/
 local_qdrant/
 

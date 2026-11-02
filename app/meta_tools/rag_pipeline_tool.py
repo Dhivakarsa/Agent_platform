@@ -12,7 +12,8 @@ import uuid
 from typing import Any, Optional
 
 from app.config import get_settings
-from app.db.vector_store import VectorStoreService, generate_deterministic_embedding, get_vector_store
+from app.db.vector_store import VectorStoreService, get_vector_store
+from app.services.embedding_service import get_embedding_service
 from app.schemas.tool import ParameterSchema, RegisteredTool
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,7 @@ class RAGPipelineTool:
     def __init__(self, vector_store: Optional[VectorStoreService] = None) -> None:
         self.settings = get_settings()
         self.vector_store = vector_store or get_vector_store()
+        self.embeddings = get_embedding_service()
         self.collection_name = self.settings.qdrant_knowledge_collection
         self._ensure_documents_indexed()
 
@@ -110,7 +112,7 @@ class RAGPipelineTool:
                 points = []
                 for doc in KNOWLEDGE_DOCS:
                     text = f"{doc['title']}\n{doc['content']}"
-                    vec = generate_deterministic_embedding(text, self.settings.embedding_dimension)
+                    vec = self.embeddings.embed(text)
                     pt_id = int(uuid.uuid5(uuid.NAMESPACE_DNS, doc["id"]).int % 0x7FFFFFFF)
                     points.append(
                         {
@@ -131,7 +133,7 @@ class RAGPipelineTool:
 
     async def query(self, query: str, domain_filter: Optional[str] = None, limit: int = 3) -> dict[str, Any]:
         """Query knowledge base for error codes, developer guides, or API specifications."""
-        query_vec = generate_deterministic_embedding(query, self.settings.embedding_dimension)
+        query_vec = self.embeddings.embed(query)
         scored_points = self.vector_store.search_vectors(
             collection_name=self.collection_name,
             query_vector=query_vec,

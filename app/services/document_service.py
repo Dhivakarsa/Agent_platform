@@ -20,7 +20,8 @@ from sqlalchemy import desc, select
 from app.config import get_settings
 from app.db.models import KnowledgeSource
 from app.db.session import async_session_factory
-from app.db.vector_store import generate_deterministic_embedding, get_vector_store
+from app.db.vector_store import get_vector_store
+from app.services.embedding_service import get_embedding_service
 from app.meta_tools.rag_pipeline_tool import KNOWLEDGE_DOCS
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class DocumentService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.vector_store = get_vector_store()
+        self.embeddings = get_embedding_service()
         self.collection_name = self.settings.qdrant_knowledge_collection
 
     def _chunk_text(self, text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
@@ -133,7 +135,7 @@ class DocumentService:
         points = []
         for idx, chunk in enumerate(chunks):
             chunk_text = f"Title: {name}\nDomain: {domain}\nSection {idx+1}:\n{chunk}"
-            vec = generate_deterministic_embedding(chunk_text, self.settings.embedding_dimension)
+            vec = self.embeddings.embed(chunk_text)
             pt_id = int(uuid.uuid5(uuid.NAMESPACE_DNS, f"{source.source_id}_{idx}").int % 0x7FFFFFFF)
             points.append(
                 {
@@ -169,16 +171,31 @@ class DocumentService:
             return res.scalar_one_or_none()
 
     async def delete_source(self, source_id: str) -> bool:
-        """Delete source from PostgreSQL metadata catalog."""
+        """
+        Delete a source's metadata row and its indexed vectors.
+
+        Both must go: removing only the row would leave orphan chunks that the RAG tool
+        would keep retrieving, so a deleted document would still answer questions.
+        """
         async with async_session_factory() as s:
             stmt = select(KnowledgeSource).where(KnowledgeSource.source_id == source_id)
             res = await s.execute(stmt)
-            src = res.scalar_one_or_none()
-            if src:
-                await s.delete(src)
-                await s.commit()
-                return True
-            return False
+            row = res.scalar_one_or_none()
+            if not row:
+                return False
+
+            removed = self.vector_store.delete_by_payload(
+                collection_name=self.collection_name,
+                key="source_id",
+                value=source_id,
+            )
+            logger.info(
+                "Deleting source '%s' (%s) and %d indexed chunk(s)", row.name, source_id, removed
+            )
+
+            await s.delete(row)
+            await s.commit()
+            return True
 
 
 _document_service: Optional[DocumentService] = None

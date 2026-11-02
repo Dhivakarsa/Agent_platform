@@ -1,118 +1,110 @@
-"""
-Task Execution Logs component for both Normal Users and Administrators.
-"""
+"""Task Execution Logs component (Screen 4) for both normal users and administrators."""
 
 from __future__ import annotations
 
 import streamlit as st
+
+from frontend.components.activity_table import render_task_log_tables
 from frontend.services.backend_client import BackendClient
 
 
-def render_task_logs(client: BackendClient) -> None:
-    """Render task execution audit logs with filtering, payload inspection, and latency metrics."""
-    token = st.session_state.get("token")
-    user = st.session_state.get("user", {})
-    is_admin = user.get("role") == "admin"
+def _render_admin_logs(client: BackendClient, token: str) -> None:
+    """Administrator view: pick a user, then see their tasks and each task's tool log."""
+    st.subheader("📜 Task Execution Logs")
+    st.caption("Expand a user to see the tasks they executed, each with its tool calls and logs.")
 
-    title_text = "📜 System-Wide Task Execution Logs" if is_admin else "📜 Personal Task Execution Logs"
-    sub_text = (
-        "Inspect all tool executions across all platform users in real-time."
-        if is_admin
-        else f"Inspect all your tool invocations and API execution records ({user.get('email')})."
-    )
-
-    st.subheader(title_text)
-    st.caption(sub_text)
-
-    # Search and Filter Controls
-    col_f1, col_f2, col_f3 = st.columns([2, 1, 1])
-    with col_f1:
-        search_kw = st.text_input("🔍 Search by Tool Name or Request ID", placeholder="e.g. invoice, refund, req-...")
-    with col_f2:
-        status_filter = st.selectbox(
-            "Filter Status",
-            ["All", "success", "error", "validation_error", "http_error", "internal_error"],
-        )
-    with col_f3:
-        limit_val = st.selectbox("Show Last", [25, 50, 100, 200], index=1)
-
-    # Fetch logs
-    with st.spinner("Fetching task logs..."):
-        try:
-            data = client.get_execution_logs(
-                token=token,
-                status=status_filter if status_filter != "All" else None,
-                search=search_kw.strip() if search_kw else None,
-                limit=limit_val,
-            )
-            logs = data.get("logs", [])
-        except Exception as exc:
-            st.error(f"Error loading execution logs: {exc}")
-            return
-
-    # KPI Summary Cards
-    tot_logs = len(logs)
-    success_count = sum(1 for l in logs if l.get("status") == "success")
-    error_count = sum(1 for l in logs if l.get("status") != "success")
-    avg_latency = (sum(l.get("latency_ms", 0) for l in logs) / tot_logs) if tot_logs > 0 else 0.0
-
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    with kpi1:
-        st.metric("Total Executed Tasks", tot_logs)
-    with kpi2:
-        st.metric("Successful Dispatches", success_count)
-    with kpi3:
-        st.metric("Failed / Errors", error_count)
-    with kpi4:
-        st.metric("Avg Latency", f"{avg_latency:.1f} ms")
-
-    st.divider()
-
-    if not logs:
-        st.info("No execution logs match the selected filter criteria. Run an instruction in the Chat interface to trigger API executions!")
+    try:
+        users = client.get_admin_users(token)
+    except Exception as exc:
+        st.error(f"Error loading users: {exc}")
         return
 
-    st.markdown(f"**Displaying {len(logs)} log records:**")
+    if not users:
+        st.info("No users registered yet.")
+        return
 
-    for entry in logs:
-        log_id = entry.get("id")
-        tool_name = entry.get("tool_name", "unknown_tool")
-        status_val = entry.get("status", "unknown").upper()
-        latency = entry.get("latency_ms", 0.0)
-        req_id = entry.get("request_id", "")
-        u_id = entry.get("user_id", "")
-        ts = str(entry.get("created_at", ""))[:19]
-        error_msg = entry.get("error_message")
+    for u in users:
+        user_id = u.get("user_id")
+        label = (
+            f"👤 {u.get('email')} | {u.get('role', 'user').upper()} "
+            f"| Tasks: {u.get('total_tasks', 0)}"
+        )
+        with st.expander(label):
+            try:
+                activity = client.get_admin_user_activity(token, user_id)
+            except Exception as exc:
+                st.caption(f"Could not load activity: {exc}")
+                continue
 
-        badge_bg = "#198754" if status_val == "SUCCESS" else "#dc3545"
+            if not activity:
+                st.caption("This user has not executed any tasks yet.")
+                continue
 
-        with st.container(border=True):
-            col_l1, col_l2, col_l3 = st.columns([2.5, 1.5, 1])
+            total_steps = sum(a.get("step_count", 0) for a in activity)
+            total_failed = sum(a.get("failed_step_count", 0) for a in activity)
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                st.metric("Tasks", len(activity))
+            with k2:
+                st.metric("Tool Calls", total_steps)
+            with k3:
+                st.metric("Failed Calls", total_failed)
 
-            with col_l1:
-                st.markdown(f"### ⚙️ `{tool_name}`")
-                st.caption(f"Request ID: `{req_id}` | Time: `{ts}`")
-                if is_admin and u_id:
-                    st.caption(f"User ID: `{u_id}`")
+            render_task_log_tables(activity, key_prefix=f"log_{user_id}")
 
-            with col_l2:
-                st.write(f"⏱️ **Latency:** `{latency:.1f} ms`")
-                if error_msg:
-                    st.error(f"⚠️ {error_msg}")
 
-            with col_l3:
-                st.markdown(
-                    f"<div style='text-align: right;'><span style='background-color: {badge_bg}; color: white; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 12px;'>{status_val}</span></div>",
-                    unsafe_allow_html=True,
-                )
+def _render_user_logs(client: BackendClient, token: str, email: str) -> None:
+    """Normal user view: only their own tasks and tool calls."""
+    st.subheader("📜 My Task Execution Logs")
+    st.caption(f"Every tool call dispatched on your behalf ({email}).")
 
-            # Expandable payload inspector
-            with st.expander("🔍 Inspect Input Arguments & Response Payload"):
-                col_sub1, col_sub2 = st.columns(2)
-                with col_sub1:
-                    st.markdown("**Input Arguments Dispatched:**")
-                    st.json(entry.get("input_args") or {})
-                with col_sub2:
-                    st.markdown("**API Response Payload / Result:**")
-                    st.json(entry.get("response_payload") or {})
+    try:
+        activity = client.get_my_activity(token)
+    except Exception as exc:
+        st.error(f"Error loading logs: {exc}")
+        return
 
+    if not activity:
+        st.info("No tasks executed yet. Run an instruction in the Chat interface!")
+        return
+
+    total_steps = sum(a.get("step_count", 0) for a in activity)
+    total_failed = sum(a.get("failed_step_count", 0) for a in activity)
+    latencies = [s.get("latency_ms", 0.0) for a in activity for s in (a.get("steps") or [])]
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("Tasks", len(activity))
+    with k2:
+        st.metric("Tool Calls", total_steps)
+    with k3:
+        st.metric("Failed Calls", total_failed)
+    with k4:
+        avg = sum(latencies) / len(latencies) if latencies else 0.0
+        st.metric("Avg Latency", f"{avg:.0f} ms")
+
+    search = st.text_input("🔍 Filter tasks by keyword", placeholder="e.g. invoice, dispute...")
+    filtered = activity
+    if search:
+        needle = search.lower()
+        filtered = [
+            a
+            for a in activity
+            if needle in (a.get("task") or "").lower()
+            or any(needle in str(s.get("tool_name", "")).lower() for s in (a.get("steps") or []))
+        ]
+        if not filtered:
+            st.caption("No tasks match that filter.")
+
+    render_task_log_tables(filtered, key_prefix="log_me")
+
+
+def render_task_logs(client: BackendClient) -> None:
+    """Render execution logs, grouped by user for administrators."""
+    token = st.session_state.get("token")
+    user = st.session_state.get("user", {})
+
+    if user.get("role") == "admin":
+        _render_admin_logs(client, token)
+    else:
+        _render_user_logs(client, token, user.get("email", ""))

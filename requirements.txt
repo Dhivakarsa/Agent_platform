@@ -7,13 +7,20 @@ pydantic-settings>=2.2.0
 # LLM & Agentic Orchestration
 google-genai>=0.1.1
 langgraph>=0.0.60
+# Durable checkpoints, so a run paused for human approval survives a restart.
+langgraph-checkpoint-sqlite>=2.0.0
+# Optional tracing; imported defensively, so an install without it still runs.
+langsmith>=0.1.0
 
 # Vector Database & Embeddings
 qdrant-client>=1.9.0
 numpy>=1.26.0
 
 # Relational Storage & Drivers
-sqlalchemy>=2.0.30
+# The asyncio extra pulls in greenlet, without which `from sqlalchemy.ext.asyncio`
+# fails at import time.
+sqlalchemy[asyncio]>=2.0.30
+greenlet>=3.0.0
 aiosqlite>=0.20.0
 asyncpg>=0.29.0
 
@@ -21,8 +28,16 @@ asyncpg>=0.29.0
 httpx>=0.27.0
 python-dotenv>=1.0.1
 
+# Document Ingestion (local PDF upload in the Sources catalog)
+pypdf>=4.2.0
+
 # Frontend Interface
 streamlit>=1.35.0
+# Imported directly for the activity/log tables, not just transitively via streamlit.
+pandas>=2.2.0
+
+# Documentation generation (python build_docs.py)
+reportlab>=4.0.0
 
 # Testing Suite
 pytest>=8.0.0

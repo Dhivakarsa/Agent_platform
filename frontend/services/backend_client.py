@@ -181,6 +181,28 @@ class BackendClient:
             resp.raise_for_status()
             return resp.json()
 
+    def get_my_activity(self, token: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Each of the caller's own tasks with its token cost and tool log rows."""
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(
+                f"{self.base_url}/usage/me/activity",
+                params={"limit": limit},
+                headers=self._headers(token),
+            )
+            resp.raise_for_status()
+            return resp.json().get("activity", [])
+
+    def get_admin_user_activity(self, token: str, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Admin: a target user's tasks, each with its tokens and its tool log rows."""
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(
+                f"{self.base_url}/admin/users/{user_id}/activity",
+                params={"limit": limit},
+                headers=self._headers(token),
+            )
+            resp.raise_for_status()
+            return resp.json().get("activity", [])
+
     def get_admin_summary(self, token: str) -> dict[str, Any]:
         """Admin overall platform metrics."""
         with httpx.Client(timeout=15.0) as client:

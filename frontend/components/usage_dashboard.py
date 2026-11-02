@@ -1,29 +1,29 @@
-"""
-Personal Usage & Activity Dashboard component (Screen 3 - Normal User View).
-"""
+"""Personal Usage & Activity Dashboard component (Screen 3 - Normal User View)."""
 
 from __future__ import annotations
 
 import streamlit as st
+
+from frontend.components.activity_table import render_task_token_table
 from frontend.services.backend_client import BackendClient
 
 
 def render_user_usage(client: BackendClient) -> None:
-    """Render personal metrics and execution history for the logged-in normal user."""
+    """Render personal metrics and per-task token usage for the logged-in user."""
     token = st.session_state.get("token")
     user = st.session_state.get("user", {})
 
-    st.subheader("📊 Personal Usage & Activity Dashboard")
-    st.caption(f"Activity, model token consumption, and execution audit history for **{user.get('email')}**.")
+    st.subheader("📊 Personal Usage & Activity")
+    st.caption(f"Activity and model token consumption for **{user.get('email')}**.")
 
     with st.spinner("Fetching personal usage statistics..."):
         try:
             summary = client.get_my_usage(token)
+            activity = client.get_my_activity(token)
         except Exception as exc:
             st.error(f"Error loading personal usage: {exc}")
             return
 
-    # Metric KPI cards
     col_k1, col_k2, col_k3, col_k4 = st.columns(4)
     with col_k1:
         st.metric("Total Requests", summary.get("total_requests", 0))
@@ -32,66 +32,47 @@ def render_user_usage(client: BackendClient) -> None:
     with col_k3:
         st.metric("Failed / Rejected", summary.get("failed_requests", 0))
     with col_k4:
-        st.metric("Total Gemini Tokens", f"{summary.get('total_tokens', 0):,}")
+        st.metric("Total Model Tokens", f"{summary.get('total_tokens', 0):,}")
 
     st.divider()
 
-    # Token breakdown
     col_tb1, col_tb2 = st.columns(2)
     with col_tb1:
-        st.markdown("#### 🧠 Gemini Token Breakdown")
+        st.markdown("#### 🧠 Token Breakdown")
         st.write(f"• **Prompt / Input Tokens:** `{summary.get('total_input_tokens', 0):,}`")
         st.write(f"• **Generated / Output Tokens:** `{summary.get('total_output_tokens', 0):,}`")
         st.write(f"• **Total Model Tokens:** `{summary.get('total_tokens', 0):,}`")
-        st.caption("Note: Tokens track Gemini LLM reasoning. External PayPal Sandbox API calls do not consume model tokens.")
+        st.caption(
+            "Tokens are the counts the model SDK reported for this account. External API "
+            "calls do not consume model tokens."
+        )
 
     with col_tb2:
         st.markdown("#### ⚡ Execution Efficiency")
-        tot = summary.get("total_requests", 0)
-        success_rate = (summary.get("successful_requests", 0) / tot * 100) if tot > 0 else 100.0
-        st.write(f"• **Task Success Rate:** `{success_rate:.1f}%`")
-        st.write(f"• **Average Tokens per Turn:** `{int(summary.get('total_tokens', 0) / (tot or 1)):,}` tokens")
+        total = summary.get("total_requests", 0)
+        rate = (summary.get("successful_requests", 0) / total * 100) if total else 0.0
+        st.write(f"• **Task Success Rate:** `{rate:.1f}%`")
+        avg = int(summary.get("total_tokens", 0) / total) if total else 0
+        st.write(f"• **Average Tokens per Task:** `{avg:,}`")
 
     st.divider()
+    st.subheader("📋 My Tasks & Token Usage")
 
-    # Execution History
-    st.subheader("📋 Personal Task Execution History")
-    executions = summary.get("recent_executions", [])
-
-    if not executions:
+    if not activity:
         st.info("No tasks executed yet. Start a conversation in the Chat screen!")
         return
 
-    # Filters
-    col_filt1, col_filt2 = st.columns(2)
-    with col_filt1:
-        status_filter = st.selectbox("Filter Status", ["All", "completed", "failed", "waiting_approval"])
-    with col_filt2:
-        search_query = st.text_input("Filter by Query Keyword", placeholder="e.g. invoice, report...")
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        statuses = ["All"] + sorted({str(a.get("status", "")) for a in activity if a.get("status")})
+        status_filter = st.selectbox("Filter Status", statuses)
+    with col_f2:
+        search = st.text_input("Filter by Keyword", placeholder="e.g. invoice, report...")
 
-    filtered_execs = executions
+    filtered = activity
     if status_filter != "All":
-        filtered_execs = [e for e in filtered_execs if e.get("status") == status_filter]
-    if search_query:
-        filtered_execs = [e for e in filtered_execs if search_query.lower() in e.get("query", "").lower()]
+        filtered = [a for a in filtered if a.get("status") == status_filter]
+    if search:
+        filtered = [a for a in filtered if search.lower() in (a.get("task") or "").lower()]
 
-    # Table view
-    for e in filtered_execs:
-        with st.container(border=True):
-            col_e1, col_e2, col_e3 = st.columns([3, 1.5, 1])
-            with col_e1:
-                st.markdown(f"**Query:** {e.get('query')}")
-                st.caption(f"Request ID: `{e.get('request_id')}` | Timestamp: {e.get('created_at')[:19]}")
-                tools = e.get("tools_used", [])
-                if tools:
-                    st.write("Tools:", ", ".join(f"`{t}`" for t in tools))
-            with col_e2:
-                st.write(f"Duration: `{e.get('duration_ms', 0):.0f} ms`")
-            with col_e3:
-                st_val = e.get("status", "completed").upper()
-                badge_bg = "#198754" if st_val in ["COMPLETED", "SUCCESS"] else "#dc3545"
-                st.markdown(
-                    f"<span style='background-color: {badge_bg}; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 11px;'>{st_val}</span>",
-                    unsafe_allow_html=True,
-                )
-
+    render_task_token_table(filtered, key_prefix="me")

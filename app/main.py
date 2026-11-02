@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import desc, select
 
 from app.config import get_settings
+from app.core.tracing import configure_tracing, tracing_enabled
 from app.core.security import (
     create_access_token,
     get_current_user,
@@ -31,7 +32,7 @@ from app.core.security import (
 )
 from app.db.models import AgentRun, ApprovalRequest, ExecutionLog, TokenUsage, User
 from app.db.session import async_session_factory, init_db
-from app.graph.workflow import run_agent
+from app.graph.workflow import close_checkpointer, resume_agent, run_agent
 from app.meta_tools.rag_pipeline_tool import get_rag_tool
 from app.schemas.auth import LoginRequest, TokenResponse, UserResponse
 from app.schemas.chat import ApprovalActionRequest, ChatRequest, ChatResponse
@@ -55,56 +56,21 @@ from app.services.document_service import get_document_service
 from app.services.execution_engine import get_execution_engine
 from app.services.ingestion import PostmanCollectionIngester, generate_full_paypal_collection
 from app.services.token_usage_service import get_token_usage_service
+from app.services.bootstrap import ensure_platform_ready, seed_system_catalog
 from app.services.tool_registry import get_tool_registry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-async def seed_system_catalog() -> int:
-    """Pre-seed the catalog with 50+ PayPal endpoints and RAG documents if empty."""
-    registry = get_tool_registry()
-    if registry.get_tool_count() == 0:
-        logger.info("Auto-seeding system catalog with PayPal 50+ collection...")
-        collection_data = generate_full_paypal_collection()
-        ingester = PostmanCollectionIngester(collection_data=collection_data)
-        tools = ingester.parse_collection()
-        await registry.register_batch(tools)
-        get_rag_tool()
-        await get_document_service().seed_default_sources()
-
-        # Seed general-purpose calculation, time, and communication tools
-        try:
-            from app.meta_tools.calculator_tool import get_general_tool_definitions
-            gen_tools = get_general_tool_definitions()
-            await registry.register_batch(gen_tools)
-            logger.info("Auto-seeded %d general-purpose tools (Calculator, Time, Email).", len(gen_tools))
-        except Exception as gen_err:
-            logger.warning("General tools auto-seed failed: %s", gen_err)
-
-        # Seed & register core MCP integration tools (Fetch & Filesystem)
-        try:
-            from app.services.mcp_client import get_mcp_service
-            mcp_svc = get_mcp_service()
-            await mcp_svc.list_servers()
-            await mcp_svc.register_mcp_tools("fetch")
-            await mcp_svc.register_mcp_tools("filesystem")
-            logger.info("Auto-seeded MCP tools (Fetch & Filesystem).")
-        except Exception as mcp_err:
-            logger.warning("MCP auto-seed skipped: %s", mcp_err)
-
-        logger.info("Catalog auto-seed completed with %d tools.", len(tools))
-        return len(tools)
-    return registry.get_tool_count()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle handler."""
     logger.info("Starting Datazoic Agentic Platform...")
-    await init_db()
-    await seed_system_catalog()
+    configure_tracing()
+    await ensure_platform_ready()
     yield
+    await close_checkpointer()
     logger.info("Datazoic Agentic Platform shutdown.")
 
 
@@ -116,12 +82,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# A wildcard origin combined with credentials would let any website call this API with a
+# signed-in user's token, so the allowed origins are explicit and configurable.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allow_origins_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -252,67 +220,88 @@ async def process_approval(
     req: ApprovalActionRequest,
     current_user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Approve or reject a pending agent action."""
+    """
+    Approve or reject a run that is paused at the policy gate.
+
+    Resumes the suspended graph with the decision, so an approved action continues through
+    execution and any remaining plan steps rather than being dispatched in isolation.
+    """
     async with async_session_factory() as s:
-        stmt = select(ApprovalRequest).where(ApprovalRequest.run_id == run_id, ApprovalRequest.status == "pending")
-        res = await s.execute(stmt)
-        app_req = res.scalar_one_or_none()
-        if not app_req:
-            raise HTTPException(status_code=404, detail="No pending approval found for this run")
+        run = (
+            await s.execute(select(AgentRun).where(AgentRun.run_id == run_id))
+        ).scalar_one_or_none()
 
-        app_req.status = "approved" if req.action == "approve" else "rejected"
-        app_req.reason = req.reason
-        app_req.decided_by = current_user["email"]
-        await s.commit()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
 
-        exec_payload = {}
-        if req.action == "approve":
-            try:
-                from app.services.execution_engine import get_execution_engine
-                from app.services.tool_registry import get_tool_registry
-                from app.schemas.tool import RegisteredTool
-                engine = get_execution_engine()
-                registry = get_tool_registry()
-                tool_name = app_req.tool_name
-                tool_obj = registry.get_tool(tool_name)
-                args = (app_req.input_args or {}).get("arguments", {})
-                if not tool_obj:
-                    tool_obj = RegisteredTool(
-                        name=tool_name,
-                        display_name=tool_name,
-                        domain="paypal" if "invoice" in tool_name or "paypal" in tool_name else "general",
-                        category="paypal" if "invoice" in tool_name or "paypal" in tool_name else "general",
-                        method="POST",
-                        path="/v1/invoicing/invoices",
-                        description=tool_name,
-                        status="enabled",
-                        is_mutating=True,
-                        approval_required=True,
+    # Only the run's owner, or an administrator, may decide its approval.
+    if current_user["role"] != "admin" and run.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="You cannot decide another user's approval")
+
+    if run.approval_status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not awaiting approval (approval_status={run.approval_status})",
+        )
+
+    action = "approve" if req.action == "approve" else "reject"
+    result = await resume_agent(run_id=run_id, action=action, reason=req.reason)
+
+    if result is None:
+        # No suspended checkpoint: the process restarted with in-memory checkpoints, or
+        # the decision was already applied.
+        async with async_session_factory() as s:
+            stale = (
+                await s.execute(
+                    select(ApprovalRequest).where(
+                        ApprovalRequest.run_id == run_id,
+                        ApprovalRequest.status == "pending",
                     )
-                exec_res = await engine.execute_tool(tool=tool_obj, arguments=args, session_id=run_id, request_id=run_id)
-                exec_payload = exec_res.response_payload
-            except Exception as e:
-                logger.exception("Error executing approved action: %s", e)
-                exec_payload = {"error": str(e)}
+                )
+            ).scalars().all()
+            for row in stale:
+                row.status = "expired"
+                row.reason = "Suspended run was no longer resumable"
+            refreshed = (
+                await s.execute(select(AgentRun).where(AgentRun.run_id == run_id))
+            ).scalar_one_or_none()
+            if refreshed:
+                refreshed.status = "failed"
+                refreshed.approval_status = "expired"
+            await s.commit()
+        raise HTTPException(
+            status_code=409,
+            detail="This run is no longer resumable. Please re-send the request.",
+        )
 
-        # Update run status
-        run_stmt = select(AgentRun).where(AgentRun.run_id == run_id)
-        run = (await s.execute(run_stmt)).scalar_one_or_none()
-        if run:
-            run.status = "completed" if req.action == "approve" else "rejected"
-            run.approval_status = app_req.status
-            if req.action == "approve":
-                run.tools_used = [app_req.tool_name]
-                run.execution_trace = [{"step": "POST_APPROVAL_EXECUTION", "tool": app_req.tool_name, "result": exec_payload}]
+    async with async_session_factory() as s:
+        decided = (
+            await s.execute(
+                select(ApprovalRequest)
+                .where(ApprovalRequest.run_id == run_id)
+                .order_by(desc(ApprovalRequest.id))
+            )
+        ).scalars().first()
+        if decided:
+            decided.decided_by = current_user["email"]
             await s.commit()
 
-        return {
-            "run_id": run_id,
-            "decision": req.action,
-            "status": app_req.status,
-            "decided_by": current_user["email"],
-            "result": exec_payload,
-        }
+    return {
+        "run_id": run_id,
+        "decision": action,
+        "status": result.approval_status,
+        "decided_by": current_user["email"],
+        "run_status": result.status,
+        "response": result.response,
+        "tools_used": result.tools_used,
+        "execution_trace": result.execution_trace,
+        "timeline_events": result.timeline_events,
+        "token_usage": result.token_usage,
+        # A later step in the same plan may need its own confirmation.
+        "pending_approval": result.pending_approval,
+        # Kept for compatibility with the existing frontend.
+        "result": (result.execution_trace or [{}])[-1].get("response", {}),
+    }
 
 
 # =============================================================================
@@ -431,6 +420,7 @@ async def test_tool_admin(
         tool=reg_tool,
         arguments=req.input_arguments,
         session_id="admin-test",
+        user_id=admin_user["user_id"],
     )
     return {
         "status": res.status.value,
@@ -599,6 +589,112 @@ async def get_user_tokens_admin(
             }
             for e in entries
         ]
+
+
+async def _build_user_activity(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    """
+    Assemble one row per executed task for a user.
+
+    AgentRun.run_id, TokenUsage.request_id and ExecutionLog.request_id all carry the
+    same per-turn request id, so a task's token cost and its individual tool calls can
+    be attached to the run they belong to.
+    """
+    async with async_session_factory() as s:
+        runs = (
+            await s.execute(
+                select(AgentRun)
+                .where(AgentRun.user_id == user_id)
+                .order_by(desc(AgentRun.id))
+                .limit(limit)
+            )
+        ).scalars().all()
+
+        run_ids = [r.run_id for r in runs]
+        if not run_ids:
+            return []
+
+        # Token cost per request id.
+        tokens_by_request: dict[str, dict[str, Any]] = {}
+        token_rows = (
+            await s.execute(select(TokenUsage).where(TokenUsage.request_id.in_(run_ids)))
+        ).scalars().all()
+        for row in token_rows:
+            bucket = tokens_by_request.setdefault(
+                row.request_id,
+                {"model": row.model, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+            bucket["input_tokens"] += row.input_tokens or 0
+            bucket["output_tokens"] += row.output_tokens or 0
+            bucket["total_tokens"] += row.total_tokens or 0
+
+        # Individual tool invocations per request id.
+        logs_by_request: dict[str, list[dict[str, Any]]] = {}
+        log_rows = (
+            await s.execute(
+                select(ExecutionLog)
+                .where(ExecutionLog.request_id.in_(run_ids))
+                .order_by(ExecutionLog.id)
+            )
+        ).scalars().all()
+        for row in log_rows:
+            logs_by_request.setdefault(row.request_id, []).append(
+                {
+                    "tool_name": row.tool_name,
+                    "status": row.status,
+                    "latency_ms": row.latency_ms,
+                    "error_message": row.error_message,
+                    "input_args": row.input_args,
+                    "response_payload": row.response_payload,
+                    "created_at": str(row.created_at),
+                }
+            )
+
+        activity: list[dict[str, Any]] = []
+        for run in runs:
+            steps = logs_by_request.get(run.run_id, [])
+            usage = tokens_by_request.get(run.run_id)
+            failed = [s_ for s_ in steps if s_["status"] != "success"]
+            activity.append(
+                {
+                    "run_id": run.run_id,
+                    "task": run.query,
+                    "status": run.status,
+                    "approval_status": run.approval_status,
+                    "tools_used": run.tools_used or [],
+                    "duration_ms": run.duration_ms,
+                    "created_at": str(run.created_at),
+                    # Per-task token cost, which Screen 3 shows beside the task.
+                    "token_usage": usage
+                    or {"model": None, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    # Per-task tool log rows, which Screen 4 renders as a table.
+                    "steps": steps,
+                    "step_count": len(steps),
+                    "failed_step_count": len(failed),
+                    "execution_trace": run.execution_trace,
+                }
+            )
+        return activity
+
+
+@app.get("/usage/me/activity", tags=["Usage"])
+async def get_my_activity(
+    limit: int = 100,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Each of the caller's own tasks with its token cost and tool log rows."""
+    activity = await _build_user_activity(current_user["user_id"], limit=limit)
+    return {"user_id": current_user["user_id"], "count": len(activity), "activity": activity}
+
+
+@app.get("/admin/users/{user_id}/activity", tags=["Admin Usage"])
+async def get_user_activity_admin(
+    user_id: str,
+    limit: int = 100,
+    admin_user: dict = Depends(require_admin),
+) -> dict[str, Any]:
+    """Administrator-only: a target user's tasks, each with tokens and tool log rows."""
+    activity = await _build_user_activity(user_id, limit=limit)
+    return {"user_id": user_id, "count": len(activity), "activity": activity}
 
 
 @app.get("/admin/usage/summary", response_model=AdminUsageOverallSummary, tags=["Admin Usage"])

@@ -125,27 +125,85 @@ class PostmanCollectionIngester:
             source="postman",
         )
 
+    # A path segment that looks like a concrete identifier rather than a static route.
+    _ID_SEGMENT = re.compile(r"^(?:[A-Z0-9][A-Z0-9_-]{2,}|\d+)$")
+
+    @classmethod
+    def _param_name_for(cls, collection_segment: str) -> str:
+        """Derive a parameter name from the collection segment that precedes an id."""
+        base = collection_segment.replace("-", "_").rstrip()
+        if base.endswith("ies"):
+            base = base[:-3] + "y"
+        elif base.endswith("ses"):
+            base = base[:-2]
+        elif base.endswith("s"):
+            base = base[:-1]
+        return f"{base}_id" if base else "resource_id"
+
+    @classmethod
+    def _template_path(cls, path: str) -> tuple[str, list[ParameterSchema]]:
+        """
+        Replace concrete id segments with {placeholders} and return the parameters.
+
+        "/v2/invoicing/invoices/INV2-1234/send" becomes
+        "/v2/invoicing/invoices/{invoice_id}/send" with one required path parameter.
+        """
+        segments = path.split("/")
+        params: list[ParameterSchema] = []
+        seen: set[str] = set()
+
+        for idx, segment in enumerate(segments):
+            if not segment or not cls._ID_SEGMENT.match(segment):
+                continue
+            previous = segments[idx - 1] if idx > 0 else ""
+            name = cls._param_name_for(previous)
+            # Keep names unique when one route carries two identifiers.
+            candidate, suffix = name, 2
+            while candidate in seen:
+                candidate = f"{name}_{suffix}"
+                suffix += 1
+            seen.add(candidate)
+            segments[idx] = "{" + candidate + "}"
+            params.append(
+                ParameterSchema(
+                    name=candidate,
+                    type="string",
+                    description=(
+                        f"Identifier of the {previous.rstrip('s') or 'resource'} to act on, "
+                        f"for example '{segment}'"
+                    ),
+                    required=True,
+                    location="path",
+                )
+            )
+
+        return "/".join(segments), params
+
     def _extract_path(self, url_obj: Any) -> str:
+        """Return the endpoint path, with identifier segments templated."""
+        raw = ""
         if isinstance(url_obj, str):
-            # Extract path from raw URL
-            parts = url_obj.split("paypal.com")
-            return parts[-1] if len(parts) > 1 else url_obj
-        if isinstance(url_obj, dict):
+            raw = url_obj
+        elif isinstance(url_obj, dict):
             raw = url_obj.get("raw", "")
-            if raw:
-                parts = raw.split("paypal.com")
-                return parts[-1].split("?")[0] if len(parts) > 1 else raw
-            path_segments = url_obj.get("path", [])
-            return "/" + "/".join(str(s) for s in path_segments)
-        return ""
+            if not raw:
+                raw = "/" + "/".join(str(s) for s in url_obj.get("path", []))
+
+        parts = raw.split("paypal.com")
+        path = parts[-1] if len(parts) > 1 else raw
+        path = path.split("?")[0]
+        templated, _ = self._template_path(path)
+        return templated
 
     def _extract_parameters(self, request: dict[str, Any]) -> list[ParameterSchema]:
         params: list[ParameterSchema] = []
 
-        # 1. URL Path parameters
         url_obj = request.get("url", {})
-        if isinstance(url_obj, dict):
-            for var in url_obj.get("variable", []):
+        raw_url = url_obj if isinstance(url_obj, str) else (url_obj or {}).get("raw", "")
+
+        # 1. URL path parameters.
+        if isinstance(url_obj, dict) and url_obj.get("variable"):
+            for var in url_obj["variable"]:
                 params.append(
                     ParameterSchema(
                         name=var.get("key", "id"),
@@ -155,15 +213,35 @@ class PostmanCollectionIngester:
                         location="path",
                     )
                 )
+        elif raw_url:
+            # String-form URL: derive path parameters from templated id segments.
+            bare = raw_url.split("paypal.com")[-1].split("?")[0]
+            _, path_params = self._template_path(bare)
+            params.extend(path_params)
 
-            # 2. Query parameters
-            for query in url_obj.get("query", []):
+        # 2. Query parameters, declared or embedded in the raw URL.
+        declared_query = url_obj.get("query", []) if isinstance(url_obj, dict) else []
+        if declared_query:
+            for query in declared_query:
                 params.append(
                     ParameterSchema(
                         name=query.get("key", ""),
                         type="string",
                         description=query.get("description", f"Query parameter {query.get('key')}"),
                         required=not query.get("disabled", False),
+                        location="query",
+                    )
+                )
+        elif raw_url and "?" in raw_url:
+            from urllib.parse import parse_qsl
+
+            for key, sample in parse_qsl(raw_url.split("?", 1)[1]):
+                params.append(
+                    ParameterSchema(
+                        name=key,
+                        type="string",
+                        description=f"Query parameter '{key}', for example '{sample}'",
+                        required=False,
                         location="query",
                     )
                 )

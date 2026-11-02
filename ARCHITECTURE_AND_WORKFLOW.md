@@ -25,13 +25,13 @@ flowchart TD
         RBAC["Role-Based Access Control (Admin vs User)"]
     end
 
-    subgraph AgenticLayer["3. Agent Orchestration Layer (LangGraph)"]
-        PlannerNode["1. Planner Node\n(Intent decomposition & entity extraction)"]
-        DiscoveryNode["2. Tool Discovery Node\n(Hybrid Qdrant + Metadata retrieval)"]
-        ReasoningNode["3. Reasoning Node\n(Gemini 2.5 / 1.5 + Token tracker)"]
-        ApprovalNode["4. Approval Check Node\n(Mutating tool pause / resume gate)"]
-        ExecutionNode["5. Execution Node\n(Dispatch & DAG state mapping)"]
-        RecoveryNode["6. Error Recovery Node\n(RAG explanation & retry logic)"]
+    subgraph AgenticLayer["3. Agent Orchestration Layer (LangGraph, 10 nodes)"]
+        PlannerNode["1-3. normalize_input → analyze_intent → select_registries"]
+        DiscoveryNode["4-5. retrieve_tools → validate_candidates\n(hybrid retrieval, bounded shortlist, candidate gate)"]
+        ReasoningNode["6. plan_and_select\n(Gemini function calling over the shortlist)"]
+        ApprovalNode["7. policy_and_approval_gate\n(risk tier; interrupt() suspends the graph)"]
+        ExecutionNode["8. execute_tool\n(validation, idempotency, audit)"]
+        RecoveryNode["9-10. evaluate_result → compose_final_answer\n(replan loop, grounded synthesis, token accounting)"]
     end
 
     subgraph StorageLayer["4. Storage & Retrieval Layer"]
@@ -98,62 +98,85 @@ sequenceDiagram
     participant DB as SQLite Audit Ledger
 
     User->>UI: Enters: "Send invoice for $50 to client@example.com"
-    UI->>API: POST /chat (prompt, session_id, bearer_token)
-    API->>LG: Initialize AgentState(prompt, user_id, session_id)
-    
-    LG->>LG: 1. Planner Node: Extract email, amount, identify sub-intents
-    LG->>Qdrant: 2. Discovery Node: Dense vector search for sub-intents
-    Qdrant-->>LG: Candidate tools: [paypal_create_draft_invoice, paypal_send_invoice]
-    
-    LG->>Gemini: 3. Reasoning Node: Prompt + Candidate Tool Schemas
-    Gemini-->>LG: Function Call: paypal_create_draft_invoice(email, amount)
-    
-    LG->>LG: 4. Approval Check: Is tool mutating & requires human approval?
-    Note over LG: paypal_create_draft_invoice is non-sensitive draft creation (proceeds)
-    
-    LG->>Router: 5. Execution Node: Dispatch paypal_create_draft_invoice
-    Router->>Target: HTTP POST /v2/invoicing/invoices
-    Target-->>Router: HTTP 201 Created {"id": "INV2-DEMO-999"}
-    Router->>DB: Write ExecutionLog (request_id, tool_name, status=SUCCESS, latency)
-    
-    LG->>LG: Update state: extracted["invoice_id"] = "INV2-DEMO-999"
-    LG->>Gemini: Next iteration: Pipe INV2-DEMO-999 into paypal_send_invoice
-    Gemini-->>LG: Function Call: paypal_send_invoice(invoice_id="INV2-DEMO-999")
-    
-    LG->>Router: Dispatch paypal_send_invoice
-    Router->>Target: HTTP POST /v2/invoicing/invoices/INV2-DEMO-999/send
-    Target-->>Router: HTTP 200 OK
-    Router->>DB: Write ExecutionLog
-    
-    LG->>LG: Synthesize final human-readable response
-    LG-->>API: Return final response + execution trace + token counts
-    API->>DB: Record TokenUsage (input_tokens, output_tokens, model)
-    API-->>UI: JSON Response
-    UI-->>User: Display formatted confirmation + expander trace
+    UI->>API: POST /chat (prompt, conversation_id, bearer_token)
+    API->>DB: Load recent turns of this session (conversation memory)
+    API->>LG: ainvoke(AgentState) on a per-run checkpoint thread
+
+    LG->>LG: 1-3. Normalize, classify intent, extract entities, scope namespaces
+    LG->>Qdrant: 4. retrieve_tools: dense vector search (domain-filtered)
+    LG->>DB: 4. retrieve_tools: sparse keyword scoring over catalog metadata
+    Qdrant-->>LG: Ranked candidates
+    Note over LG: RRF fusion + dependency expansion + 2 pinned meta-tools<br/>→ bounded shortlist (~10 schemas)
+    LG->>LG: 5. validate_candidates: mandatory fields present?
+
+    LG->>Gemini: 6. plan_and_select: query + shortlist as function declarations
+    Gemini-->>LG: Function call: paypal_send_invoice(invoice_id, recipient_email, ...)
+    Note over LG: A name outside the shortlist is discarded here
+
+    LG->>LG: 7. policy_and_approval_gate: risk tier / mutating?
+    LG->>DB: Record ApprovalRequest (status=pending)
+    Note over LG: interrupt() suspends the graph INSIDE this node;<br/>state is persisted by the checkpointer
+    LG-->>API: __interrupt__ with the approval payload
+    API-->>UI: status=waiting_approval + pending_approval
+    UI-->>User: Approval card (tool, reason, exact arguments)
+
+    User->>UI: Clicks Approve
+    UI->>API: POST /runs/{run_id}/approval (action=approve)
+    API->>LG: ainvoke(Command(resume={action})) on the same thread
+    Note over LG: Execution continues from inside the gate
+
+    LG->>Router: 8. execute_tool: validate args, attach idempotency key
+    Router->>Target: HTTP POST /v2/invoicing/invoices/{invoice_id}/send
+    Target-->>Router: HTTP 202 Accepted
+    Router->>DB: Write ExecutionLog (user_id, request_id, tool, status, latency)
+
+    LG->>LG: 9. evaluate_result: goal met, or another step needed?
+    Note over LG: If more work remains, control returns to plan_and_select<br/>with every completed step's results in context
+    LG->>Gemini: 10. compose_final_answer: synthesise from the execution trace
+    Gemini-->>LG: Grounded reply + usage_metadata token counts
+    LG->>DB: Record TokenUsage (input, output, total, model)
+    LG->>DB: Update AgentRun (status, tools_used, trace, final_response)
+    API-->>UI: JSON response + timeline + trace + token usage
+    UI-->>User: Reply, the stages that actually ran, and the trace
 ```
 
 ---
 
 ### Workflow 2: Human-in-the-Loop (HITL) Approval Workflow
-When an agent selects a sensitive or mutating tool (e.g. issuing a high-value refund or deleting a resource):
+
+An action is gated when its risk tier is `external_write`, `financial` or `destructive`, when its
+approval policy demands confirmation, or when it is marked mutating. The reason shown to the user
+names the condition that actually triggered.
+
+The gate calls LangGraph's `interrupt()`, which **suspends the graph inside the node** rather than
+ending the turn. Resuming continues the original flow, so remaining plan steps are not lost.
 
 ```mermaid
 flowchart TD
-    ReasoningDone["Reasoning Node selects Tool Call"] --> CheckApproval{"ToolDefinition.approval_required == True\nOR Sensitive Mutating Tool?"}
-    
-    CheckApproval -->|No| ExecNode["Execution Node: Dispatch Tool"]
-    CheckApproval -->|Yes| CheckStatus{"AgentState.approval_status == 'approved'?"}
-    
-    CheckStatus -->|Yes| ExecNode
-    CheckStatus -->|No| PauseWorkflow["1. Record ApprovalRequest in DB\n2. Set state['approval_status'] = 'pending'\n3. Pause LangGraph workflow"]
-    
-    PauseWorkflow --> RenderCard["Streamlit Chat renders Approval Card\n(Tool Name, Inferred Arguments, Warning)"]
-    RenderCard --> UserDecision{"User clicks Approve or Reject?"}
-    
-    UserDecision -->|Reject| Abort["POST /chat/approval (action='reject')\nWorkflow terminates with 'Action cancelled by user'"]
-    UserDecision -->|Approve| Resume["POST /chat/approval (action='approve')\nWorkflow re-hydrates state and resumes execution"]
-    Resume --> ExecNode
+    Planned["plan_and_select returns a tool call"] --> CheckRisk{"Risk tier, approval policy,<br/>or is_mutating?"}
+
+    CheckRisk -->|"None apply"| ExecNode["execute_tool: dispatch"]
+    CheckRisk -->|"Any applies"| Persist["Record ApprovalRequest (status=pending)<br/>deterministic approval_id, so a resume<br/>does not create a second row"]
+
+    Persist --> Interrupt["interrupt(payload)<br/>graph suspends; state persisted to<br/>the SQLite checkpointer"]
+    Interrupt --> Card["Chat renders the approval card<br/>(tool, reason, exact arguments)"]
+    Card --> Decision{"Approve or Reject?"}
+
+    Decision -->|Reject| Rejected["Settle row as rejected<br/>approval_status = rejected<br/>pending_tool_call cleared<br/>→ compose_final_answer"]
+    Decision -->|Approve| Resumed["Settle row as approved<br/>interrupt() returns the decision<br/>→ execute_tool"]
+    Resumed --> ExecNode
+    ExecNode --> Evaluate["evaluate_result → continue the plan<br/>(a later step may need its own approval)"]
 ```
+
+**Guarantees**
+
+| Property | How |
+| :--- | :--- |
+| Survives a restart | Checkpoints are SQLite-backed; a pending run is resumable after the process dies |
+| Cannot be disturbed | One checkpoint thread per run, so the next message in the conversation does not touch it |
+| Owner-gated | Only the run's owner, or an administrator, may decide it (`403` otherwise) |
+| Single-use | A settled run returns `409` instead of executing again |
+| Fails safe | An unrecoverable checkpoint marks the run expired and asks the user to re-send, rather than dispatching silently |
 
 ---
 
@@ -216,96 +239,159 @@ flowchart TD
 
 ## 4. Canonical Data Model Reference
 
-The platform relies on 7 primary database tables:
+The platform relies on 9 database tables:
 
 | Model Name | Table Name | Key Attributes | Purpose |
 | :--- | :--- | :--- | :--- |
 | **`User`** | `users` | `user_id`, `email`, `password_hash`, `role` (`admin`/`user`), `is_active` | RBAC authentication and session ownership. |
-| **`ToolDefinition`** | `tool_definitions` | `tool_id`, `name`, `category`, `method`, `endpoint_path`, `source_type`, `mcp_server_name`, `request_body_schema`, `approval_required`, `status` | Canonical technical registry for all 66+ tools. |
+| **`ToolDefinition`** | `tool_definitions` | `tool_id`, `name`, `category`, `method`, `endpoint_path`, `source_type`, `mcp_server_name`, `request_body_schema`, `approval_required`, `status` | Canonical tool contract. Parameters persist by location (`path_params`, `query_params`, `request_body_schema`), with `tags` holding retrieval keywords and `dependencies` the prerequisite edges, so the full contract survives a restart. |
 | **`MCPServerDefinition`**| `mcp_servers` | `server_id`, `name`, `display_name`, `server_type` (`builtin`/`stdio`), `command`, `args`, `is_active` | Configured open-source and native MCP servers. |
 | **`KnowledgeSource`** | `knowledge_sources` | `source_id`, `name`, `source_type` (`file`/`url`), `chunk_count`, `created_at` | Tracks uploaded RAG documentation. |
 | **`ExecutionLog`** | `execution_log` | `request_id`, `session_id`, `user_id`, `tool_name`, `status`, `input_args`, `response_payload`, `latency_ms` | Immutable audit ledger powering the **Task Logs** screen. |
 | **`TokenUsage`** | `token_usage` | `request_id`, `user_id`, `model`, `input_tokens`, `output_tokens`, `total_tokens` | Per-user Gemini cost and consumption accounting. |
-| **`ApprovalRequest`** | `approval_requests` | `run_id`, `user_id`, `tool_name`, `arguments`, `status` (`pending`/`approved`/`rejected`) | Human-in-the-loop pause/resume control. |
+| **`ApprovalRequest`** | `approval_requests` | `approval_id`, `run_id`, `user_id`, `tool_name`, `input_args`, `status` (`pending`/`approved`/`rejected`/`expired`), `decided_by` | Human-in-the-loop decisions. `approval_id` is deterministic per step, so resuming does not create a duplicate row. |
+| **`AgentRun`** | `agent_runs` | `run_id`, `user_id`, `session_id`, `query`, `status`, `approval_status`, `tools_used`, `execution_trace`, `final_response`, `duration_ms` | One row per turn. `final_response` is what makes conversation history replayable into later turns. |
+| **`Conversation`** | `conversations` | `conversation_id`, `user_id`, `title`, `messages` | Conversation records. |
+
+> [!NOTE]
+> `agent_runs.run_id`, `token_usage.request_id` and `execution_log.request_id` all carry the same
+> per-turn identifier. Joining on it is what lets a task be reported with its own token cost and
+> its own tool-call rows, which is what the Usage and Logs screens do.
 
 ---
 
 ## 5. Key Architecture & Workflow Change Points
 
-Use this section to identify where you can modify the current system design:
+Where to extend the system, and what is already in place.
 
 ### 1. Agent Orchestration (LangGraph Layer)
-- **Current State**: A 6-node linear graph with cyclic reasoning loops (`planner` ➔ `tool_discovery` ➔ `reasoning` ➔ `approval_check` ➔ `execution` ➔ `recovery`).
-- **Potential Changes**:
-  - Add a **Multi-Agent Architecture** (e.g., specialized sub-agents: `InvoicingAgent`, `DisputeAgent`, `MCPDiagnosticsAgent`).
-  - Add **Memory Checkpointing** (using SQLite or Postgres checkpoints instead of in-memory LangGraph state).
-  - Replace the planner node with a full **ReAct** (Reason + Act) loop.
+- **Current state**: an explicit 10-node graph (`normalize_input` → `analyze_intent` →
+  `select_registries` → `retrieve_tools` → `validate_candidates` → `plan_and_select` →
+  `policy_and_approval_gate` → `execute_tool` → `evaluate_result` → `compose_final_answer`),
+  compiled with a **SQLite checkpointer**. Multi-step work is model-driven: `evaluate_result`
+  returns control to the planner with every completed step's results in context, and the loop
+  ends when the model stops calling tools (bounded by `max_iterations`).
+- **Possible changes**:
+  - Specialised sub-agents per domain (`InvoicingAgent`, `DisputeAgent`), if domains diverge
+    enough to need separate prompting strategies.
+  - A reflection node that critiques a plan before execution, for high-risk actions.
+  - Parallel execution of independent steps, which currently run sequentially.
 
 ### 2. Tool Retrieval & Discovery
-- **Current State**: Dual search (intent keywords classify domain ➔ Qdrant retrieves top-K candidates ➔ always attaches 2 meta-tools).
-- **Potential Changes**:
-  - Implement dynamic sparse BM25 scoring alongside dense vector search (true hybrid RRF).
-  - Introduce dynamic tool hierarchy / namespaces (e.g. grouping tools under modules to scale beyond 1,000+ tools without context window overflow).
+- **Current state**: domain classification from keyword patterns → dense Qdrant search with a
+  domain payload filter, alongside sparse keyword scoring → **Reciprocal Rank Fusion** →
+  prerequisite dependency expansion → the two pinned meta-tools appended unconditionally. The
+  domain filter is relaxed and the search repeated if it returns too little.
+- **Possible changes**:
+  - Replace the token-overlap sparse score with **BM25** proper, for better term weighting.
+  - Add a **cross-encoder re-ranker** over the fused shortlist, which matters most where one
+    domain holds many near-identical endpoints.
+  - Use real embeddings for the knowledge base; it currently uses the deterministic fallback, so
+    document retrieval does not generalise to synonyms.
+  - Build a labelled query → expected-tool set and measure shortlist recall directly, separating
+    retrieval quality from model quality.
 
 ### 3. Execution Router & Adapters
-- **Current State**: Single `ExecutionEngine` class that branches on `source_type` (`http_api`, `mcp`, `internal`).
-- **Potential Changes**:
-  - Extract into dedicated Strategy/Plugin pattern (`HttpExecutionAdapter`, `McpExecutionAdapter`, `InternalExecutionAdapter`).
-  - Introduce async background job queues (e.g. Celery / Redis / BackgroundTasks) for long-running batch API operations.
+- **Current state**: a single `ExecutionEngine` branching on `source_type`
+  (`http_api`, `mcp`, internal meta-tools), with parameter validation, idempotency headers on
+  mutating calls, and an audit row per attempt including failures.
+- **Possible changes**:
+  - Extract into a Strategy/plugin pattern (`HttpExecutionAdapter`, `McpExecutionAdapter`,
+    `InternalExecutionAdapter`).
+  - Add a background job queue for long-running batch operations.
+  - Add per-tool circuit breaking and retry policy driven by the existing `retry_config` column.
 
-### 4. Frontend & Backend Transport
-- **Current State**: Synchronous HTTP POST requests from Streamlit via `BackendClient`.
-- **Potential Changes**:
-  - Implement Server-Sent Events (SSE) or WebSockets on `GET /chat/stream` for real-time word-by-word token streaming.
-  - Decouple frontend completely (e.g. Next.js / React UI talking to the same FastAPI backend).
+### 4. Observability
+- **Current state**: a per-turn stage timeline surfaced in the chat screen, plus the relational
+  audit tables. Token counts come from the SDK's `usage_metadata`.
+- **Possible changes**:
+  - Wire in **LangSmith** or an equivalent tracer. This is configuration rather than redesign,
+    since the pipeline is already a checkpointed graph.
+  - Emit metrics (per-stage latency, shortlist hit rate, approval rates) to a time-series store.
+
+### 5. Frontend & Backend Transport
+- **Current state**: synchronous HTTP from Streamlit via `BackendClient`. The chat screen renders
+  the stage timeline the backend reports for each turn.
+- **Possible changes**:
+  - Server-Sent Events or WebSockets for token-by-token streaming and live stage updates during a
+    turn, rather than after it.
+  - Decouple the frontend entirely (for example a Next.js UI against the same API).
+
+### 6. Persistence
+- **Current state**: SQLAlchemy models with `create_all`, plus ad-hoc `ALTER TABLE` statements in
+  `init_db` for columns added to an existing SQLite file.
+- **Possible changes**:
+  - Adopt **Alembic** before any deployment that must preserve data.
+  - Delete a source's vectors alongside its metadata row, and add a reindex command.
 
 ---
 
 ## 6. Current File System Mapping
 
 ```
-application_agent/
+Agent_platform/
 ├── app/
-│   ├── main.py                     # FastAPI entry point, lifespan, routes & DI
-│   ├── config.py                   # Pydantic Settings (.env loader)
+│   ├── main.py                      # FastAPI app: endpoints, RBAC deps, startup seeding
+│   ├── config.py                    # Pydantic Settings (.env loader)
 │   ├── core/
-│   │   └── security.py             # Salted PBKDF2 hashing & JWT tokens
+│   │   ├── security.py              # PBKDF2 hashing, JWT issue/verify, role dependencies
+│   │   ├── exceptions.py            # Typed application errors
+│   │   └── telemetry.py             # Logging helpers
 │   ├── db/
-│   │   ├── models.py               # SQLAlchemy ORM models
-│   │   ├── session.py              # Async SQLite engine & auto-migration
-│   │   └── vector_store.py         # Qdrant client (query_points + deterministic fallback)
+│   │   ├── models.py                # SQLAlchemy ORM models (9 tables)
+│   │   ├── session.py               # Async engine, init_db, SQLite column auto-migration
+│   │   └── vector_store.py          # Qdrant client + deterministic embedding fallback
 │   ├── graph/
-│   │   ├── state.py                # AgentState TypedDict
-│   │   ├── nodes.py                # Planner, Discovery, Reasoning, Approval, Execution
-│   │   └── workflow.py             # LangGraph StateGraph builder & runner
+│   │   ├── state.py                 # AgentState TypedDict
+│   │   ├── nodes.py                 # The 10 pipeline nodes + deterministic fallback planner
+│   │   └── workflow.py              # StateGraph, checkpointer, run_agent / resume_agent
 │   ├── meta_tools/
-│   │   ├── rag_pipeline_tool.py    # Pinned Meta-Tool 1 (Documentation RAG)
-│   │   └── system_search_tool.py  # Pinned Meta-Tool 2 (Capabilities & Audit Logs)
-│   ├── schemas/
-│   │   ├── auth.py, chat.py, mcp.py, tool.py, usage.py
+│   │   ├── rag_pipeline_tool.py     # Pinned meta-tool 1 (knowledge-base retrieval)
+│   │   ├── system_search_tool.py    # Pinned meta-tool 2 (catalog + execution-log search)
+│   │   ├── calculator_tool.py       # General-purpose tools (calculation, time) + definitions
+│   │   └── email_tool.py            # Draft / send email (simulated without SMTP config)
+│   ├── schemas/                     # Pydantic request/response models
+│   │   └── agent.py, auth.py, chat.py, mcp.py, paypal.py, source.py, tool.py, usage.py
 │   └── services/
-│       ├── execution_engine.py     # Unified Execution Router & audit logger
-│       ├── mcp_client.py           # Native & Stdio MCP protocol manager
-│       ├── tool_registry.py        # SQL + Qdrant tool catalog manager
-│       ├── tool_retriever.py       # Two-stage intent classifier & vector search
-│       └── token_usage_service.py  # User-level token accounting
+│       ├── llm_service.py           # Gemini function calling, grounded synthesis, token counts
+│       ├── tool_registry.py         # Dual-index catalog (relational contract + vector index)
+│       ├── tool_retriever.py        # Two-stage hybrid retrieval, RRF, dependency expansion
+│       ├── execution_engine.py      # Validation, idempotency, dispatch (mock/HTTP/MCP), audit
+│       ├── ingestion.py             # Postman collection parsing into tool contracts
+│       ├── document_service.py      # Document/URL ingestion, chunking, vector indexing
+│       ├── mcp_client.py            # MCP discovery and stdio JSON-RPC bridge
+│       └── token_usage_service.py   # Per-user token accounting and summaries
 ├── frontend/
-│   ├── app.py                      # Streamlit navigation & screen router
+│   ├── app.py                       # Streamlit navigation and screen router
 │   ├── components/
-│   │   ├── chat.py                 # Chat UI with execution trace & HITL cards
-│   │   ├── login.py                # Login screen with quick demo accounts
-│   │   ├── sidebar.py              # User badge, screen radio, test scenarios
-│   │   ├── tool_catalog.py         # Tab A: API Tools catalog & management
-│   │   ├── source_catalog.py       # Tab B: Document RAG ingestion
-│   │   ├── mcp_catalog.py          # Tab C: MCP servers & direct test workbench
-│   │   ├── usage_dashboard.py      # User personal token statistics
-│   │   ├── user_management.py      # Admin system-wide usage drilldown
-│   │   └── task_logs.py            # Task Logs audit inspector with KPIs
+│   │   ├── chat.py                  # Screen 1: chat, real stage timeline, approval cards
+│   │   ├── login.py                 # Login with quick demo accounts
+│   │   ├── sidebar.py               # User badge, screen selector, sample scenarios
+│   │   ├── tool_catalog.py          # Screen 2a: catalog browse and admin registration
+│   │   ├── tool_creation.py         # Screen 2a: tool creation form
+│   │   ├── source_catalog.py        # Screen 2b: document and URL ingestion
+│   │   ├── mcp_catalog.py           # Screen 2c: MCP servers and test workbench
+│   │   ├── activity_table.py        # Shared per-task token and tool-call tables
+│   │   ├── usage_dashboard.py       # Screen 3: personal usage, per-task tokens
+│   │   ├── user_management.py       # Screen 3: admin directory and per-user drilldown
+│   │   └── task_logs.py             # Screen 4: logs grouped by user, per-task tool tables
 │   └── services/
-│       └── backend_client.py       # Frontend HTTP client (target: 127.0.0.1:8000)
-├── sandbox_storage/                # Sandboxed directory for Filesystem MCP tools
-├── requirements.txt                # Pinned dependencies
-├── start.bat                       # Root batch launcher
-└── run_application.bat             # Dual-window launcher (10s wait + health check)
+│       └── backend_client.py        # HTTP client (target: 127.0.0.1:8000)
+├── tests/
+│   ├── unit/                        # Auth, permissions, retrieval, ingestion, meta-tools
+│   │   └── test_llm_planner.py      # Planner contract against a stubbed Gemini SDK
+│   ├── integration/
+│   │   ├── test_paypal_flows.py     # End-to-end turns for the task's scenarios
+│   │   └── test_approval_resume.py  # Suspend/resume, rejection, restart survival, memory
+│   ├── evals/                       # Golden queries and eval runner
+│   └── benchmarks/                  # Catalog generator and benchmark runner
+├── docs/                            # Generated PDFs + the assignment brief (task.txt)
+├── build_docs.py                    # Regenerates the docs/ PDF set
+├── sandbox_storage/                 # Sandboxed directory for the Filesystem MCP tools
+├── requirements.txt                 # Dependencies
+├── docker-compose.yml               # Optional local PostgreSQL + Qdrant
+├── run_application.bat              # Windows launcher (venv, install, both processes)
+└── README.md                        # Entry point and quickstart
 ```
+
 

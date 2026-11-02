@@ -101,6 +101,11 @@ async def init_db() -> None:
                             connection.execute(text("ALTER TABLE tool_definitions ADD COLUMN namespace VARCHAR(128) DEFAULT 'paypal'"))
                         if "capabilities" not in existing_cols:
                             connection.execute(text("ALTER TABLE tool_definitions ADD COLUMN capabilities JSON DEFAULT '[]'"))
+
+                    res = connection.execute(text("PRAGMA table_info(agent_runs)"))
+                    run_cols = {row[1] for row in res.fetchall()}
+                    if run_cols and "final_response" not in run_cols:
+                        connection.execute(text("ALTER TABLE agent_runs ADD COLUMN final_response TEXT"))
                 except Exception:
                     pass
 

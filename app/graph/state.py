@@ -50,6 +50,7 @@ class AgentState(TypedDict, total=False):
     execution_log: List[Dict[str, Any]]
     execution_trace: List[Dict[str, Any]]
     last_result: Optional[Dict[str, Any]]
+    next_action: str  # "replan", "execute_next", "finish"
     has_next_step: bool
     iteration_count: int
     max_iterations: int

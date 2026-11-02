@@ -126,6 +126,49 @@ class VectorStoreService:
             )
         return []
 
+    def delete_by_payload(self, collection_name: str, key: str, value: Any) -> int:
+        """
+        Delete every point whose payload field ``key`` equals ``value``.
+
+        Used to remove a knowledge source's chunks when the source is deleted, so a
+        removed document stops being retrievable instead of lingering as orphan vectors.
+        Returns the number of points that matched before deletion.
+        """
+        try:
+            matched = self.client.count(
+                collection_name=collection_name,
+                count_filter=rest_models.Filter(
+                    must=[
+                        rest_models.FieldCondition(
+                            key=key, match=rest_models.MatchValue(value=value)
+                        )
+                    ]
+                ),
+            ).count
+        except Exception as exc:
+            logger.warning("Could not count points for %s=%s: %s", key, value, exc)
+            matched = 0
+
+        try:
+            self.client.delete(
+                collection_name=collection_name,
+                points_selector=rest_models.FilterSelector(
+                    filter=rest_models.Filter(
+                        must=[
+                            rest_models.FieldCondition(
+                                key=key, match=rest_models.MatchValue(value=value)
+                            )
+                        ]
+                    )
+                ),
+            )
+            logger.info("Deleted %d vector(s) where %s=%s", matched, key, value)
+        except Exception as exc:
+            logger.warning("Could not delete vectors where %s=%s: %s", key, value, exc)
+            return 0
+
+        return matched
+
     def count(self, collection_name: str) -> int:
         """Return point count in collection."""
         try:

@@ -17,7 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db.models import ToolDefinition
 from app.db.session import async_session_factory
-from app.db.vector_store import VectorStoreService, generate_deterministic_embedding, get_vector_store
+from app.db.vector_store import VectorStoreService, get_vector_store
+from app.services.embedding_service import get_embedding_service
 from app.schemas.tool import (
     HttpMethod,
     ParameterSchema,
@@ -36,9 +37,41 @@ class ToolRegistry:
     def __init__(self, vector_store: Optional[VectorStoreService] = None) -> None:
         self.settings = get_settings()
         self.vector_store = vector_store or get_vector_store()
+        self.embeddings = get_embedding_service()
         self._memory_cache: dict[str, RegisteredTool] = {}
-        self._embedding_cache: dict[str, list[float]] = {}
-        self._remote_embedding_disabled: bool = False
+
+    @staticmethod
+    def _contract_columns(tool: RegisteredTool) -> dict[str, Any]:
+        """
+        Split a tool's contract across the columns that persist it.
+
+        Parameters are stored by location (path/query/body), keywords in ``tags`` and
+        prerequisite edges in ``dependencies``, so ``list_tools`` can rebuild the whole
+        contract after a restart. Both write paths use this to stay consistent.
+        """
+        params_json = [p.model_dump() for p in tool.parameters]
+        deps_json = [
+            d.model_dump() if hasattr(d, "model_dump") else d
+            for d in (tool.dependencies or [])
+        ]
+
+        body_params = [p for p in params_json if p.get("location") not in ("path", "query")]
+        body_schema = dict(tool.request_body_schema or {})
+        if body_params:
+            body_schema.setdefault("params", body_params)
+
+        existing_edges = {d.get("tool") for d in deps_json if isinstance(d, dict)}
+        for prior in tool.requires_prior or []:
+            if prior not in existing_edges:
+                deps_json.append({"tool": prior})
+
+        return {
+            "path_params": [p for p in params_json if p.get("location") == "path"],
+            "query_params": [p for p in params_json if p.get("location") == "query"],
+            "request_body_schema": body_schema,
+            "tags": list(tool.keywords or tool.tags or []),
+            "dependencies": deps_json,
+        }
 
     def _build_indexing_summary(self, tool: RegisteredTool) -> str:
         """Construct dense semantic summary representing tool capabilities for vectorization."""
@@ -59,33 +92,8 @@ class ToolRegistry:
         )
 
     def _generate_embedding(self, text: str) -> list[float]:
-        """Generate embedding vector using GenAI or fallback to local deterministic generator."""
-        if text in self._embedding_cache:
-            return self._embedding_cache[text]
-
-        vec: list[float] = []
-        api_key = self.settings.GEMINI_API_KEY
-        if api_key and not self._remote_embedding_disabled:
-            try:
-                from google import genai
-                client = genai.Client(api_key=api_key)
-                response = client.models.embed_content(
-                    model=self.settings.embedding_model,
-                    contents=text,
-                )
-                if hasattr(response, "embeddings") and response.embeddings:
-                    vec = list(response.embeddings[0].values)
-                elif hasattr(response, "embedding") and getattr(response.embedding, "values", None):
-                    vec = list(response.embedding.values)
-            except Exception as exc:
-                self._remote_embedding_disabled = True
-                logger.info("Remote embedding unavailable (%s); using local deterministic embeddings.", exc)
-
-        if not vec:
-            vec = generate_deterministic_embedding(text, self.settings.embedding_dimension)
-
-        self._embedding_cache[text] = vec
-        return vec
+        """Embed a tool summary through the shared provider."""
+        return self.embeddings.embed(text)
 
     async def register_tool(self, tool: RegisteredTool, session: Optional[AsyncSession] = None) -> str:
         """Insert or update a tool into relational store and Qdrant index."""
@@ -96,8 +104,7 @@ class ToolRegistry:
             res = await s.execute(stmt)
             existing = res.scalar_one_or_none()
 
-            params_json = [p.model_dump() for p in tool.parameters]
-            deps_json = [d.model_dump() if hasattr(d, "model_dump") else d for d in tool.dependencies]
+            contract = self._contract_columns(tool)
 
             if existing:
                 existing.display_name = tool.display_name or tool.name
@@ -109,8 +116,12 @@ class ToolRegistry:
                 existing.endpoint_path = tool.path
                 existing.is_mutating = tool.is_mutating
                 existing.approval_required = tool.approval_required
-                existing.request_body_schema = tool.request_body_schema or {"params": params_json}
-                existing.dependencies = deps_json
+                for column, value in contract.items():
+                    setattr(existing, column, value)
+                existing.risk_level = (
+                    tool.risk_level.value if hasattr(tool.risk_level, "value") else str(tool.risk_level)
+                )
+                existing.namespace = tool.namespace
             else:
                 row = ToolDefinition(
                     name=tool.name,
@@ -123,8 +134,11 @@ class ToolRegistry:
                     endpoint_path=tool.path,
                     is_mutating=tool.is_mutating,
                     approval_required=tool.approval_required,
-                    request_body_schema=tool.request_body_schema or {"params": params_json},
-                    dependencies=deps_json,
+                    **contract,
+                    risk_level=(
+                        tool.risk_level.value if hasattr(tool.risk_level, "value") else str(tool.risk_level)
+                    ),
+                    namespace=tool.namespace,
                 )
                 s.add(row)
             await s.commit()
@@ -195,8 +209,7 @@ class ToolRegistry:
                 stmt = select(ToolDefinition).where(ToolDefinition.name == tool.name)
                 res = await s.execute(stmt)
                 existing = res.scalar_one_or_none()
-                params_json = [p.model_dump() for p in tool.parameters]
-                deps_json = [d.model_dump() if hasattr(d, "model_dump") else d for d in (tool.dependencies or [])]
+                contract = self._contract_columns(tool)
 
                 src_type = str(getattr(tool, "source_type", "http_api"))
                 if hasattr(getattr(tool, "source_type", None), "value"):
@@ -226,8 +239,7 @@ class ToolRegistry:
                             remote_tool_name=getattr(tool, "remote_tool_name", None),
                             is_mutating=tool.is_mutating,
                             approval_required=tool.approval_required,
-                            request_body_schema={"params": params_json},
-                            dependencies=deps_json,
+                            **contract,
                         )
                     )
                 else:
@@ -241,6 +253,8 @@ class ToolRegistry:
                     existing.approval_required = tool.approval_required
                     existing.is_mutating = tool.is_mutating
                     existing.endpoint_path = tool.path or existing.endpoint_path
+                    for column, value in contract.items():
+                        setattr(existing, column, value)
             await s.commit()
 
         return len(tools)
@@ -421,10 +435,43 @@ class ToolRegistry:
                     approval_required=r.approval_required,
                     request_body_schema=r.request_body_schema or {},
                     response_schema=r.response_schema or {},
+                    parameters=self._rehydrate_parameters(r),
+                    keywords=list(r.tags or []),
+                    tags=list(r.tags or []),
+                    requires_prior=[
+                        d.get("tool")
+                        for d in (r.dependencies or [])
+                        if isinstance(d, dict) and d.get("tool")
+                    ],
                 )
-                self._memory_cache[r.name] = t
-                results.append(t)
+                # A cached entry built at registration time is at least as complete as
+                # this row, so never replace it with a reconstruction.
+                self._memory_cache.setdefault(r.name, t)
+                results.append(self._memory_cache.get(r.name, t))
             return results
+
+    @staticmethod
+    def _rehydrate_parameters(row: ToolDefinition) -> list[ParameterSchema]:
+        """Reassemble the parameter list from the columns register_tool wrote it to."""
+        raw: list[Any] = []
+        raw.extend(row.path_params or [])
+        raw.extend(row.query_params or [])
+        raw.extend((row.request_body_schema or {}).get("params", []) or [])
+
+        params: list[ParameterSchema] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            if item["name"] in seen:
+                continue
+            seen.add(item["name"])
+            try:
+                params.append(ParameterSchema(**item))
+            except Exception:
+                logger.debug("Skipping malformed parameter %r on tool %s", item, row.name)
+        return params
+
 
     def get_tool_count(self) -> int:
         return len(self._memory_cache)

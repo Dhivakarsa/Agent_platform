@@ -16,10 +16,18 @@ async def test_paypal_invoicing_flow():
     query = "Send an invoice for $50 to client@example.com"
     response = await run_agent(query=query, session_id="test_invoicing_001")
 
-    assert response.session_id == "test_invoicing_001"
-    assert "invoice" in response.response.lower()
-    assert len(response.tools_used) >= 1
-    assert any("invoice" in t for t in response.tools_used)
+    assert response.conversation_id == "test_invoicing_001"
+
+    # Sending an invoice mutates external state, so the policy gate must pause the run
+    # for human confirmation rather than dispatching it.
+    assert response.status == "waiting_approval"
+    assert response.approval_status == "pending"
+    assert response.pending_approval is not None
+    assert "invoice" in response.pending_approval["tool_name"]
+
+    # The captured arguments must carry what the user actually supplied.
+    args = response.pending_approval["arguments"]
+    assert args.get("recipient_email") == "client@example.com" or args.get("to") == "client@example.com"
 
 
 @pytest.mark.asyncio

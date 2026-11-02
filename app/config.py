@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 480  # 8 hours for local dev session
 
+    # Origins allowed to call the API from a browser. Comma-separated in the environment.
+    cors_allow_origins: str = "http://localhost:8501,http://127.0.0.1:8501"
+
+    @property
+    def cors_allow_origins_list(self) -> list[str]:
+        """Allowed CORS origins as a list, with blanks removed."""
+        return [o.strip() for o in self.cors_allow_origins.split(",") if o.strip()]
+
     # ── Initial Local Demo Accounts (Bootstrapped securely into DB) ──────
     bootstrap_admin_email: str = "admin@examplemail.com"
     bootstrap_admin_password: str = "admin@123"
@@ -50,6 +58,14 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     embedding_model: str = "text-embedding-004"
     embedding_dimension: int = 768
+
+    # ── Observability (LangSmith) ────────────────────────────────────────
+    # Tracing stays off until a key is supplied; the per-turn timeline and the audit
+    # tables are always available regardless.
+    langsmith_tracing: bool = True
+    langsmith_api_key: str = Field(default="", description="LangSmith API key; empty disables tracing")
+    langsmith_project: str = "datazoic-agentic-platform"
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
 
     # ── Database ─────────────────────────────────────────────────────────
     database_url: str = "sqlite+aiosqlite:///./agentic_system.db"

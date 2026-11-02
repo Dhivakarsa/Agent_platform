@@ -22,6 +22,9 @@ import time
 from typing import Any, Dict, List, Optional
 import uuid
 
+from langgraph.types import interrupt
+from sqlalchemy import select
+
 from app.config import get_settings
 from app.db.models import AgentRun, ApprovalRequest
 from app.db.session import async_session_factory
@@ -29,11 +32,41 @@ from app.graph.state import AgentState
 from app.meta_tools.rag_pipeline_tool import get_rag_tool
 from app.schemas.tool import ApprovalPolicy, ExecutionStatus, RegisteredTool, RiskLevel
 from app.services.execution_engine import get_execution_engine
+from app.services.llm_service import get_llm_service
 from app.services.token_usage_service import get_token_usage_service
 from app.services.tool_registry import get_tool_registry
 from app.services.tool_retriever import get_tool_retriever
 
 logger = logging.getLogger(__name__)
+
+_EMPTY_TOKENS: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def _accumulate_tokens(current: Dict[str, int], addition: Dict[str, int]) -> Dict[str, int]:
+    """Sum token counters across the several model calls made during one turn."""
+    merged = {
+        "input_tokens": int(current.get("input_tokens", 0)) + int(addition.get("input_tokens", 0)),
+        "output_tokens": int(current.get("output_tokens", 0)) + int(addition.get("output_tokens", 0)),
+    }
+    merged["total_tokens"] = merged["input_tokens"] + merged["output_tokens"]
+    return merged
+
+
+def _completed_step_summaries(state: AgentState) -> List[Dict[str, Any]]:
+    """Condense already-executed steps so the planner can chain multi-step work."""
+    summaries: List[Dict[str, Any]] = []
+    for step in state.get("execution_trace", []):
+        if step.get("step") != "execution":
+            continue
+        summaries.append(
+            {
+                "tool": step.get("tool_name"),
+                "arguments": step.get("arguments", {}),
+                "status": step.get("status"),
+                "result": step.get("response"),
+            }
+        )
+    return summaries
 
 
 # ── 1. normalize_input ────────────────────────────────────────────────────────
@@ -120,11 +153,22 @@ async def analyze_intent_node(state: AgentState) -> dict[str, Any]:
     intent = "GENERAL_QA"
     confidence = 0.85
 
-    if re.search(r"\b(calculate|math|multiply|divide|percentage|sqrt)\b", q_lower) or any(c in q_lower for c in ["+", "*", "/"]):
+    if re.search(
+        r"\b(what tools|which tools|tools are available|available tools|capabilities|"
+        r"last request|my last|status of my|execution log|what can you do)\b",
+        q_lower,
+    ):
+        intent = "SYSTEM_INTROSPECTION"
+    elif re.search(r"\b(calculate|math|multiply|divide|percentage|sqrt)\b", q_lower) or any(c in q_lower for c in ["+", "*", "/"]):
         intent = "CALCULATION"
     elif re.search(r"\b(time|timezone|clock|today|date)\b", q_lower):
         intent = "TIME"
-    elif re.search(r"\b(documentation|docs|policy|policies|fee|fees|guide|faq)\b", q_lower):
+    elif re.search(
+        r"\b(documentation|docs|policy|policies|fee|fees|guide|faq|"
+        r"reason codes?|error codes?|status codes?|troubleshoot|"
+        r"supported currenc\w*|which currenc\w*|lifecycle|idempotency)\b",
+        q_lower,
+    ) or re.search(r"\b(what|which) (are|is) the (valid|allowed|supported|standard)\b", q_lower):
         intent = "KNOWLEDGE_RAG"
     elif re.search(r"\b(sales|volume|sales volume|revenue|analytics|report|reports|statement)\b", q_lower):
         intent = "REPORTING"
@@ -181,7 +225,7 @@ async def select_registries_node(state: AgentState) -> dict[str, Any]:
     intent = state.get("intent", "GENERAL_QA")
     selected: List[str] = []
 
-    if intent in ["CALCULATION", "TIME"]:
+    if intent in ["CALCULATION", "TIME", "SYSTEM_INTROSPECTION"]:
         selected = ["general"]
     elif intent == "COMMUNICATION":
         selected = ["communication", "general"]
@@ -246,6 +290,13 @@ async def retrieve_tools_node(state: AgentState) -> dict[str, Any]:
         if email_tool and email_tool.name not in [t.name for t in bounded_tools]:
             bounded_tools.append(email_tool)
 
+    # The two meta-tools are pinned: always offered to the planner regardless of retrieval
+    # score, so the agent can always consult documentation or introspect the system itself.
+    for pinned_name in ("rag_pipeline_tool", "system_search_tool"):
+        pinned = registry.get_tool(pinned_name)
+        if pinned and pinned.name not in [t.name for t in bounded_tools]:
+            bounded_tools.append(pinned)
+
     candidate_ids = [t.name for t in bounded_tools]
     candidate_summaries = [
         {
@@ -254,7 +305,7 @@ async def retrieve_tools_node(state: AgentState) -> dict[str, Any]:
             "risk_level": t.risk_level.value if hasattr(t.risk_level, "value") else str(t.risk_level),
             "approval_policy": t.approval_policy.value if hasattr(t.approval_policy, "value") else str(t.approval_policy),
             "description": t.description,
-            "parameters": [p.dict() if hasattr(p, "dict") else p for p in t.parameters],
+            "parameters": [p.model_dump() if hasattr(p, "model_dump") else p for p in t.parameters],
         }
         for t in bounded_tools
     ]
@@ -272,7 +323,7 @@ async def retrieve_tools_node(state: AgentState) -> dict[str, Any]:
 
     return {
         "candidate_tool_ids": candidate_ids,
-        "candidate_tools": [t.dict() for t in bounded_tools],
+        "candidate_tools": [t.model_dump() for t in bounded_tools],
         "candidate_summaries": candidate_summaries,
         "timeline_events": timeline,
     }
@@ -317,15 +368,82 @@ async def validate_candidates_node(state: AgentState) -> dict[str, Any]:
 # ── 6. plan_and_select ────────────────────────────────────────────────────────
 
 
-async def plan_and_select_node(state: AgentState) -> dict[str, Any]:
-    """Formulate execution step selecting ONLY from bounded candidates, or direct answer."""
-    # If clarification was requested, do not plan tool calls
-    if state.get("requires_clarification"):
-        return {
-            "pending_tool_call": None,
-            "plan": [],
-        }
+# Entity keys that can satisfy a declared parameter, beyond an exact name match.
+_PARAM_ALIASES: Dict[str, tuple[str, ...]] = {
+    "invoice_id": ("invoice_id",),
+    "order_id": ("order_id",),
+    "transaction_id": ("transaction_id",),
+    "dispute_id": ("dispute_id",),
+    "recipient_email": ("email", "recipient"),
+    "to": ("email", "recipient"),
+    "email": ("email", "recipient"),
+    "amount": ("amount",),
+    "currency_code": ("currency_code",),
+}
 
+
+def _fill_from_entities(
+    summary: Dict[str, Any], entities: Dict[str, Any]
+) -> tuple[Dict[str, Any], List[str]]:
+    """
+    Populate a tool's parameters from extracted entities.
+
+    Returns the arguments that could be filled and the names of required parameters
+    that remain unsatisfied.
+    """
+    arguments: Dict[str, Any] = {}
+    unmet: List[str] = []
+
+    for param in summary.get("parameters", []) or []:
+        name = param.get("name")
+        if not name:
+            continue
+        for key in (name,) + _PARAM_ALIASES.get(name, ()):
+            if entities.get(key) not in (None, ""):
+                arguments[name] = entities[key]
+                break
+        else:
+            if param.get("required"):
+                unmet.append(name)
+
+    return arguments, unmet
+
+
+def _select_satisfiable_candidate(
+    state: AgentState,
+) -> Optional[tuple[str, Dict[str, Any]]]:
+    """
+    Pick the best candidate whose required parameters can all be filled.
+
+    Candidates keep their retrieval ranking, so this returns the highest-ranked tool
+    that is actually executable. Falls back to the best read-only candidate with no
+    required parameters, so an under-specified request lists rather than guesses.
+    """
+    entities = state.get("dependency_mapping", {}) or {}
+    summaries = state.get("candidate_summaries") or []
+
+    for summary in summaries:
+        arguments, unmet = _fill_from_entities(summary, entities)
+        if not unmet:
+            return summary["name"], arguments
+
+    # Nothing fully satisfiable: prefer a listing/search tool that needs no input.
+    for summary in summaries:
+        name = summary.get("name", "")
+        required = [p for p in summary.get("parameters", []) or [] if p.get("required")]
+        if not required and any(verb in name for verb in ("list", "search", "show_all")):
+            return name, {}
+
+    return None
+
+
+def _deterministic_plan(state: AgentState) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Rule-based planner used when the Gemini reasoning layer is unavailable.
+
+    Keeps the platform demonstrable offline (no API key, hermetic tests) at the cost of
+    only recognising the intents encoded below. Returns (plan, pending_tool_call).
+    """
     intent = state.get("intent", "GENERAL_QA")
     query = state["user_prompt"]
     entities = state.get("dependency_mapping", {})
@@ -404,7 +522,7 @@ async def plan_and_select_node(state: AgentState) -> dict[str, Any]:
                 "name": tool_name,
                 "arguments": {
                     "invoice_id": entities.get("invoice_id", f"INV2-{uuid.uuid4().hex[:8].upper()}"),
-                    "recipient_email": entities.get("email", "dhivakarsa10@hotmail.com"),
+                    "recipient_email": entities.get("email") or entities.get("recipient"),
                     "amount": entities.get("amount", "50.00"),
                     "currency_code": entities.get("currency_code", "USD"),
                 },
@@ -433,7 +551,7 @@ async def plan_and_select_node(state: AgentState) -> dict[str, Any]:
                     "tool": email_tool,
                     "description": f"Dispatch sales volume report via Google SMTP to {entities.get('email', 'recipient')}",
                     "arguments": {
-                        "to": entities.get("email", "dhivakarsa10@hotmail.com"),
+                        "to": entities.get("email") or entities.get("recipient"),
                         "subject": "Monthly Sales Volume & Financial Performance Report",
                         "body": "$DEPENDENCY:STEP_1_REPORT",
                     },
@@ -446,19 +564,92 @@ async def plan_and_select_node(state: AgentState) -> dict[str, Any]:
 
     # 6. Knowledge RAG
     elif intent == "KNOWLEDGE_RAG":
-        pending_call = {
-            "name": "search_paypal_documentation",
-            "arguments": {"query": query},
-        }
-        plan = [{"step": 1, "tool": "search_paypal_documentation", "description": "Query documentation knowledge base"}]
+        pending_call = {"name": "rag_pipeline_tool", "arguments": {"query": query}}
+        plan = [{"step": 1, "tool": "rag_pipeline_tool", "description": "Query documentation knowledge base"}]
 
-    # 6. Fallback
+    # 7. System introspection (capabilities catalog or past execution status)
+    elif intent == "SYSTEM_INTROSPECTION":
+        q_lower = query.lower()
+        scope = "execution_logs" if re.search(r"\b(last|status|log|history|request)\b", q_lower) else "capabilities"
+        keywords = " ".join(
+            w for w in re.findall(r"\w+", q_lower)
+            if w not in {"what", "which", "tools", "are", "available", "for", "managing", "my", "the", "is", "of", "status"}
+        )
+        pending_call = {"name": "system_search_tool", "arguments": {"scope": scope, "query": keywords.strip()}}
+        plan = [{"step": 1, "tool": "system_search_tool", "description": f"Introspect system ({scope})"}]
+
+    # 8. Fallback: best candidate whose required parameters can actually be filled.
     elif candidate_names:
-        best_tool = candidate_names[0]
-        pending_call = {"name": best_tool, "arguments": {}}
-        plan = [{"step": 1, "tool": best_tool, "description": f"Execute candidate {best_tool}"}]
+        chosen = _select_satisfiable_candidate(state)
+        if chosen:
+            best_tool, arguments = chosen
+            pending_call = {"name": best_tool, "arguments": arguments}
+            plan = [
+                {
+                    "step": 1,
+                    "tool": best_tool,
+                    "description": f"Execute candidate {best_tool}",
+                    "arguments": arguments,
+                }
+            ]
 
+    return plan, pending_call
+
+
+async def plan_and_select_node(state: AgentState) -> dict[str, Any]:
+    """
+    Select the next tool call, constrained to the bounded candidate shortlist.
+
+    Primary path: Gemini function calling over the retrieved candidate schemas. The model
+    sees only the top-k tools the retrieval stage selected, which is what keeps accuracy
+    flat as the catalog grows from 50 to 1,000+ tools.
+
+    Fallback path: the deterministic rule planner, used when no API key is configured or
+    the model call fails.
+    """
+    # If clarification was requested upstream, do not plan tool calls.
+    if state.get("requires_clarification"):
+        return {"pending_tool_call": None, "plan": []}
+
+    query = state["user_prompt"]
+    candidates = state.get("candidate_summaries") or []
     timeline = list(state.get("timeline_events", []))
+    tokens = dict(state.get("token_usage") or _EMPTY_TOKENS)
+
+    plan: List[Dict[str, Any]] = []
+    pending_call: Optional[Dict[str, Any]] = None
+    direct_answer: Optional[str] = None
+    planner_mode = "deterministic"
+
+    llm = get_llm_service()
+    choice = await llm.choose_tool(
+        user_prompt=query,
+        candidates=candidates,
+        history=state.get("messages", []),
+        completed_steps=_completed_step_summaries(state),
+    )
+
+    if choice is not None:
+        planner_mode = "gemini_function_calling"
+        tokens = _accumulate_tokens(tokens, choice.usage.as_dict())
+
+        if choice.is_tool_call:
+            pending_call = {"name": choice.tool_name, "arguments": choice.arguments}
+            plan = [
+                {
+                    "step": 1,
+                    "tool": choice.tool_name,
+                    "description": choice.reasoning,
+                    "arguments": choice.arguments,
+                }
+            ]
+        elif choice.direct_answer:
+            # The model answered without a tool, or asked for a missing parameter.
+            direct_answer = choice.direct_answer
+
+    if choice is None:
+        plan, pending_call = _deterministic_plan(state)
+
     selected_name = pending_call.get("name") if pending_call else "None (Direct Answer)"
     timeline.append(
         {
@@ -466,22 +657,39 @@ async def plan_and_select_node(state: AgentState) -> dict[str, Any]:
             "status": "completed",
             "timestamp": time.time(),
             "details": f"Planned action: {selected_name}",
-            "metadata": {"planned_tool": selected_name, "plan": plan},
+            "metadata": {
+                "planned_tool": selected_name,
+                "plan": plan,
+                "planner": planner_mode,
+                "candidates_considered": len(candidates),
+            },
         }
     )
 
-    return {
+    result: dict[str, Any] = {
         "plan": plan,
         "pending_tool_call": pending_call,
         "timeline_events": timeline,
+        "token_usage": tokens,
     }
+    if direct_answer:
+        result["final_response"] = direct_answer
+    return result
 
 
 # ── 7. policy_and_approval_gate ───────────────────────────────────────────────
 
 
 async def policy_and_approval_gate_node(state: AgentState) -> dict[str, Any]:
-    """Inspect tool risk level. If FINANCIAL or EXTERNAL_WRITE and unapproved, halt with HITL approval card."""
+    """
+    Classify the planned action's risk and require human confirmation when it mutates
+    external state.
+
+    When confirmation is needed the node calls ``interrupt()``, which suspends the graph
+    here and persists its state through the checkpointer. Resuming with a decision
+    re-enters this node, ``interrupt()`` returns that decision, and execution continues
+    into the rest of the plan rather than being dispatched out-of-band.
+    """
     pending = state.get("pending_tool_call")
     if not pending:
         return {"policy_decision": "NO_OP"}
@@ -498,18 +706,33 @@ async def policy_and_approval_gate_node(state: AgentState) -> dict[str, Any]:
             risk = RiskLevel.READ_ONLY
 
     policy = getattr(tool, "approval_policy", ApprovalPolicy.AUTO_APPROVED)
-    requires_approval = (
-        risk in [RiskLevel.EXTERNAL_WRITE, RiskLevel.FINANCIAL, RiskLevel.DESTRUCTIVE]
-        or policy == ApprovalPolicy.REQUIRE_APPROVAL
-        or getattr(tool, "approval_required", False)
-        or getattr(tool, "is_mutating", False)
-    )
 
-    current_approval = state.get("approval_status", "not_required")
+    # Track why approval is needed so the user sees an accurate reason, not a risk tier
+    # that may not be the trigger.
+    approval_reasons: List[str] = []
+    if risk in [RiskLevel.EXTERNAL_WRITE, RiskLevel.FINANCIAL, RiskLevel.DESTRUCTIVE]:
+        approval_reasons.append(f"risk tier {risk.value}")
+    if policy == ApprovalPolicy.REQUIRE_APPROVAL or getattr(tool, "approval_required", False):
+        approval_reasons.append("tool policy requires approval")
+    if getattr(tool, "is_mutating", False):
+        approval_reasons.append(f"{getattr(tool, 'method', 'POST')} mutates external state")
+    requires_approval = bool(approval_reasons)
 
-    # If already approved in this turn or by user action
-    if current_approval == "approved":
-        timeline = list(state.get("timeline_events", []))
+    timeline = list(state.get("timeline_events", []))
+
+    if not requires_approval:
+        timeline.append(
+            {
+                "stage": "policy_and_approval_gate",
+                "status": "auto_approved",
+                "timestamp": time.time(),
+                "details": f"Action {pending['name']} auto-approved ({risk.value}).",
+            }
+        )
+        return {"policy_decision": "AUTO_APPROVED", "timeline_events": timeline}
+
+    # A decision already recorded for this step (for example a pre-approved retry).
+    if state.get("approval_status") == "approved":
         timeline.append(
             {
                 "stage": "policy_and_approval_gate",
@@ -520,64 +743,125 @@ async def policy_and_approval_gate_node(state: AgentState) -> dict[str, Any]:
         )
         return {"policy_decision": "APPROVED", "timeline_events": timeline}
 
-    if requires_approval and current_approval != "approved":
-        req_id = f"appr-{uuid.uuid4().hex[:8]}"
-        approval_payload = {
-            "approval_request_id": req_id,
-            "tool_name": pending["name"],
-            "risk_level": risk.value if hasattr(risk, "value") else str(risk),
-            "arguments": pending.get("arguments", {}),
-            "warning": f"This action is classified as {risk.value.upper()} and mutates external state. Confirmation required.",
-        }
+    # Deterministic id: this node re-executes on resume, so a random id would create a
+    # second approval row for the same step.
+    step_index = state.get("iteration_count", 0)
+    req_id = f"appr-{state.get('request_id', 'run')}-{step_index}"
 
-        # Persist approval request
-        async with async_session_factory() as s:
-            appr_record = ApprovalRequest(
-                approval_id=req_id,
-                run_id=state.get("request_id", ""),
-                user_id=state.get("user_id", "default_user"),
-                tool_name=pending["name"],
-                input_args=approval_payload,
-                status="pending",
-            )
-            s.add(appr_record)
-            await s.commit()
+    approval_payload = {
+        "approval_request_id": req_id,
+        "tool_name": pending["name"],
+        "risk_level": risk.value if hasattr(risk, "value") else str(risk),
+        "arguments": pending.get("arguments", {}),
+        "reasons": approval_reasons,
+        "warning": f"Approval required: {'; '.join(approval_reasons)}. Confirm to proceed.",
+    }
 
-        timeline = list(state.get("timeline_events", []))
+    await _record_approval_request(state, req_id, pending["name"], approval_payload)
+
+    # Suspend the graph. On the first pass this raises GraphInterrupt and the caller sees
+    # the payload; on resume it returns the decision that was supplied.
+    decision = interrupt(approval_payload)
+
+    action = "approve"
+    reason = None
+    if isinstance(decision, dict):
+        action = str(decision.get("action", "approve")).lower()
+        reason = decision.get("reason")
+    elif isinstance(decision, str):
+        action = decision.lower()
+    elif decision is False:
+        action = "reject"
+
+    await _settle_approval_request(req_id, action, reason)
+
+    if action in ("reject", "rejected", "cancel", "deny"):
         timeline.append(
             {
                 "stage": "policy_and_approval_gate",
-                "status": "paused_for_approval",
+                "status": "rejected",
                 "timestamp": time.time(),
-                "details": f"Execution paused: {pending['name']} requires HITL human confirmation ({risk.value}).",
+                "details": f"User rejected {pending['name']}." + (f" Reason: {reason}" if reason else ""),
                 "metadata": approval_payload,
             }
         )
-
         return {
-            "approval_status": "pending",
+            "approval_status": "rejected",
             "approval_request_id": req_id,
-            "pending_approval": approval_payload,
-            "policy_decision": "APPROVAL_REQUIRED",
+            "pending_approval": None,
+            "pending_tool_call": None,
+            "policy_decision": "REJECTED",
             "timeline_events": timeline,
-            "final_response": f"⚠️ **Human Approval Required**: The planned action `{pending['name']}` ({risk.value.upper()}) will mutate external state. Please confirm or cancel below.",
+            "final_response": (
+                f"\u274c Cancelled. I did not run `{pending['name']}`."
+                + (f"{chr(10)}{chr(10)}Reason: {reason}" if reason else "")
+            ),
         }
 
-    # Auto-approved
-    timeline = list(state.get("timeline_events", []))
     timeline.append(
         {
             "stage": "policy_and_approval_gate",
-            "status": "auto_approved",
+            "status": "approved",
             "timestamp": time.time(),
-            "details": f"Action {pending['name']} auto-approved ({risk.value}).",
+            "details": f"User approved {pending['name']}; proceeding to execution.",
+            "metadata": approval_payload,
         }
     )
-
     return {
-        "policy_decision": "AUTO_APPROVED",
+        "approval_status": "approved",
+        "approval_request_id": req_id,
+        "pending_approval": None,
+        "policy_decision": "APPROVED",
         "timeline_events": timeline,
     }
+
+
+async def _record_approval_request(
+    state: AgentState,
+    approval_id: str,
+    tool_name: str,
+    payload: Dict[str, Any],
+) -> None:
+    """Persist a pending approval, tolerating the node re-running on resume."""
+    try:
+        async with async_session_factory() as s:
+            existing = (
+                await s.execute(
+                    select(ApprovalRequest).where(ApprovalRequest.approval_id == approval_id)
+                )
+            ).scalar_one_or_none()
+            if existing:
+                return
+            s.add(
+                ApprovalRequest(
+                    approval_id=approval_id,
+                    run_id=state.get("request_id", ""),
+                    user_id=state.get("user_id", "default_user"),
+                    tool_name=tool_name,
+                    input_args=payload,
+                    status="pending",
+                )
+            )
+            await s.commit()
+    except Exception as exc:
+        logger.warning("Could not persist approval request %s: %s", approval_id, exc)
+
+
+async def _settle_approval_request(approval_id: str, action: str, reason: Optional[str]) -> None:
+    """Mark a persisted approval row with the decision the user made."""
+    try:
+        async with async_session_factory() as s:
+            row = (
+                await s.execute(
+                    select(ApprovalRequest).where(ApprovalRequest.approval_id == approval_id)
+                )
+            ).scalar_one_or_none()
+            if row and row.status == "pending":
+                row.status = "approved" if action.startswith("appro") else "rejected"
+                row.reason = reason
+                await s.commit()
+    except Exception as exc:
+        logger.warning("Could not settle approval request %s: %s", approval_id, exc)
 
 
 # ── 8. execute_tool ───────────────────────────────────────────────────────────
@@ -610,10 +894,12 @@ async def execute_tool_node(state: AgentState) -> dict[str, Any]:
         arguments=pending.get("arguments", {}),
         session_id=state.get("session_id", "default_session"),
         request_id=state.get("request_id"),
+        user_id=state.get("user_id", "system"),
+        user_role=state.get("user_role", "user"),
     )
 
     exec_log = list(state.get("execution_log", []))
-    exec_log.append(res.dict() if hasattr(res, "dict") else res.__dict__)
+    exec_log.append(res.model_dump() if hasattr(res, "model_dump") else res.__dict__)
 
     trace = list(state.get("execution_trace", []))
     trace.append(
@@ -655,93 +941,108 @@ async def execute_tool_node(state: AgentState) -> dict[str, Any]:
 
 
 async def evaluate_result_node(state: AgentState) -> dict[str, Any]:
-    """Check execution result, assess multi-step goals, and determine if another turn is needed."""
-    last_res = state.get("last_result", {})
-    pending = state.get("pending_tool_call", {})
+    """
+    Decide whether the goal is met or another step is required.
+
+    With the reasoning layer available the decision is delegated to the model: control
+    returns to ``plan_and_select``, which sees the results of every completed step and
+    either selects the next tool or answers. That is what makes genuine multi-step work
+    (fetch a report, then email it) possible without hardcoding the chain.
+
+    Without it, the deterministic chain below handles the two flows the rule planner knows.
+    """
+    last_res = state.get("last_result", {}) or {}
+    pending = state.get("pending_tool_call") or {}
     tool_name = pending.get("name", "")
     iteration = state.get("iteration_count", 1)
     max_iter = state.get("max_iterations", 10)
+    budget_left = iteration < max_iter
 
-    # Multi-step goal check: DAG chaining across plan steps
+    timeline = list(state.get("timeline_events", []))
+
+    # ── Model-driven replanning ──────────────────────────────────────────
+    if get_llm_service().available:
+        last_status = None
+        for step in reversed(state.get("execution_trace", [])):
+            if step.get("step") == "execution":
+                last_status = step.get("status")
+                break
+        # Always return to the planner while budget remains. The loop terminates when the
+        # model stops calling tools, which also lets it react to a failed step by retrying
+        # with corrected arguments or consulting the RAG tool about the error code.
+        should_replan = budget_left
+
+        timeline.append(
+            {
+                "stage": "evaluate_result",
+                "status": "completed",
+                "timestamp": time.time(),
+                "details": (
+                    "Returning to planner to decide the next step."
+                    if should_replan
+                    else "Iteration budget exhausted; composing answer."
+                ),
+                "metadata": {"iteration": iteration, "last_status": last_status},
+            }
+        )
+        return {
+            "next_action": "replan" if should_replan else "finish",
+            "has_next_step": should_replan,
+            "pending_tool_call": None,
+            "timeline_events": timeline,
+        }
+
+    # ── Deterministic chaining fallback ──────────────────────────────────
     has_next = False
     next_step = None
     plan = list(state.get("plan", []))
     step_idx = state.get("current_step_index", 0)
 
     # 1. Multi-step plan transition (e.g. Step 1: Reporting -> Step 2: Email Dispatch)
-    if len(plan) > 1 and step_idx == 0 and iteration < max_iter:
+    if len(plan) > 1 and step_idx == 0 and budget_left:
         next_step_def = plan[1]
         has_next = True
         next_tool = next_step_def["tool"]
         next_args = dict(next_step_def.get("arguments", {}))
 
         # Output-to-input mapping: pass output from Step 1 into Step 2
-        if next_tool == "send_email":
-            sales_val = "4,250.75"
-            curr = "USD"
-            if isinstance(last_res, dict):
-                sales_dict = last_res.get("total_sales_volume", {})
-                if isinstance(sales_dict, dict):
-                    sales_val = sales_dict.get("value", "4,250.75")
-                    curr = sales_dict.get("currency_code", "USD")
-            items_cnt = last_res.get("total_items", 15) if isinstance(last_res, dict) else 15
-            fees_dict = last_res.get("total_fee", {}) if isinstance(last_res, dict) else {}
-            fee_val = fees_dict.get("value", "127.50") if isinstance(fees_dict, dict) else "127.50"
-            recip = next_args.get("to") or state.get("dependency_mapping", {}).get("email", "dhivakarsa10@hotmail.com")
-
-            try:
-                net_val = f"{float(str(sales_val).replace(',', '')) - float(str(fee_val).replace(',', '')):.2f}"
-            except Exception:
-                net_val = "4,123.25"
-
-            body_content = (
-                f"Monthly Sales Volume & Financial Report:\n"
-                f"==========================================\n"
-                f"Period:              Last Month (October 2026)\n"
-                f"Total Sales Volume:  ${sales_val} {curr}\n"
-                f"Total Transactions:  {items_cnt} successful payments\n"
-                f"Processing Fees:     ${fee_val} {curr}\n"
-                f"Net Settled Revenue: ${net_val} {curr}\n"
-                f"Status:              Reconciled & Audited\n"
-                f"==========================================\n\n"
-                f"This report was automatically synthesized by Datazoic Agentic Platform\n"
-                f"and dispatched to {recip} via Google SMTP."
-            )
-            next_args["body"] = body_content
-            next_args["to"] = recip
+        if next_tool == "send_email" and isinstance(last_res, dict):
+            next_args["body"] = _format_report_email(last_res)
+            recipient = next_args.get("to") or state.get("dependency_mapping", {}).get("email")
+            if recipient:
+                next_args["to"] = recipient
 
         next_step = {"name": next_tool, "arguments": next_args}
         step_idx = 1
 
-    # 2. Invoicing multi-step fallback
+    # 2. Invoicing multi-step fallback: a created draft must be sent to be payable.
     elif "create" in tool_name and "invoice" in tool_name and "send" in state.get("user_prompt", "").lower():
         inv_id = last_res.get("id") or last_res.get("invoice_id")
-        if inv_id and iteration < max_iter:
+        recipient = last_res.get("recipient_email") or state.get("dependency_mapping", {}).get("email")
+        if inv_id and recipient and budget_left:
             has_next = True
-            recip = last_res.get("recipient_email") or state.get("dependency_mapping", {}).get("email", "dhivakarsa10@hotmail.com")
-            amt = last_res.get("amount", {}).get("value") if isinstance(last_res.get("amount"), dict) else state.get("dependency_mapping", {}).get("amount", "50.00")
-            curr = last_res.get("amount", {}).get("currency_code") if isinstance(last_res.get("amount"), dict) else "USD"
+            amount_obj = last_res.get("amount") if isinstance(last_res.get("amount"), dict) else {}
             next_step = {
                 "name": "send_invoice",
                 "arguments": {
                     "invoice_id": inv_id,
-                    "recipient_email": recip,
-                    "amount": amt,
-                    "currency_code": curr,
+                    "recipient_email": recipient,
+                    "amount": amount_obj.get("value") or state.get("dependency_mapping", {}).get("amount"),
+                    "currency_code": amount_obj.get("currency_code", "USD"),
                 },
             }
 
-    timeline = list(state.get("timeline_events", []))
     timeline.append(
         {
             "stage": "evaluate_result",
             "status": "completed",
             "timestamp": time.time(),
-            "details": f"Evaluation: {'Scheduling next step' if has_next else 'Goal achieved.'}",
+            "details": "Scheduling next step." if has_next else "Goal achieved.",
         }
     )
 
     return {
+        "next_action": "execute_next" if has_next else "finish",
         "has_next_step": has_next,
         "current_step_index": step_idx,
         "pending_tool_call": next_step if has_next else None,
@@ -749,11 +1050,41 @@ async def evaluate_result_node(state: AgentState) -> dict[str, Any]:
     }
 
 
+def _format_report_email(report: dict[str, Any]) -> str:
+    """Format a transaction report payload as an email body, using only returned figures."""
+    sales = report.get("total_sales_volume") or {}
+    fees = report.get("total_fee") or {}
+    sales_val = sales.get("value") if isinstance(sales, dict) else None
+    fee_val = fees.get("value") if isinstance(fees, dict) else None
+    currency = (sales.get("currency_code") if isinstance(sales, dict) else None) or "USD"
+    items = report.get("total_items")
+
+    lines = ["Sales Volume & Financial Report", "=" * 34]
+    if sales_val is not None:
+        lines.append(f"Total Sales Volume:  {sales_val} {currency}")
+    if items is not None:
+        lines.append(f"Total Transactions:  {items}")
+    if fee_val is not None:
+        lines.append(f"Processing Fees:     {fee_val} {currency}")
+    try:
+        net = float(str(sales_val).replace(",", "")) - float(str(fee_val).replace(",", ""))
+        lines.append(f"Net Settled Revenue: {net:.2f} {currency}")
+    except (TypeError, ValueError):
+        pass
+    lines += ["=" * 34, "", "Generated by the Datazoic Agentic Platform."]
+    return "\n".join(lines)
+
+
 # ── 10. compose_final_answer ──────────────────────────────────────────────────
 
 
-async def compose_final_answer_node(state: AgentState) -> dict[str, Any]:
-    """Synthesize final user-facing response, record token accounting, and finalize timeline."""
+def _render_template_answer(state: AgentState) -> str:
+    """
+    Render the user-facing answer from per-intent templates.
+
+    Fallback for when Gemini synthesis is unavailable. Deterministic and offline-safe,
+    but only covers the intents encoded below.
+    """
     existing_response = state.get("final_response")
     last_res = state.get("last_result")
     pending = state.get("pending_tool_call")
@@ -797,51 +1128,84 @@ async def compose_final_answer_node(state: AgentState) -> dict[str, Any]:
                     f"*(Source: {top_match.get('title', 'PayPal Developer Docs')})*"
                 )
             else:
-                response_text = "📖 According to the indexed documentation, PayPal supports RESTful APIs with sandbox testing, webhook listeners, and OAuth2 bearer authentication."
-        elif intent == "REPORTING":
-            sales_val = "4,250.75"
-            curr = "USD"
-            items_cnt = 15
-            fee_val = "127.50"
-            for t in state.get("execution_trace", []):
-                res_obj = t.get("response") or t.get("result", {})
-                if isinstance(res_obj, dict) and "total_sales_volume" in res_obj:
-                    sales_dict = res_obj.get("total_sales_volume", {})
-                    if isinstance(sales_dict, dict):
-                        sales_val = sales_dict.get("value", "4,250.75")
-                        curr = sales_dict.get("currency_code", "USD")
-                    items_cnt = res_obj.get("total_items", 15)
-                    fees_dict = res_obj.get("total_fee", {})
-                    if isinstance(fees_dict, dict):
-                        fee_val = fees_dict.get("value", "127.50")
-
-            try:
-                net_val = f"{float(str(sales_val).replace(',', '')) - float(str(fee_val).replace(',', '')):.2f}"
-            except Exception:
-                net_val = "4,123.25"
-
-            email_dispatched = any("email" in (t.get("tool_name") or t.get("tool", "")) for t in state.get("execution_trace", []))
-            recip = state.get("dependency_mapping", {}).get("email", "dhivakarsa10@hotmail.com")
-
-            if email_dispatched:
                 response_text = (
-                    f"📊 **Monthly Sales Volume Report Synthesized & Dispatched:**\n\n"
-                    f"Here is your sales performance breakdown for last month:\n"
-                    f"- **Total Sales Volume:** **${sales_val} {curr}**\n"
-                    f"- **Transactions Processed:** {items_cnt} payments\n"
-                    f"- **PayPal Processing Fees:** ${fee_val} {curr}\n"
-                    f"- **Net Settled Revenue:** **${net_val} {curr}**\n\n"
-                    f"📬 **Email Dispatch Confirmation:**\n"
-                    f"The full performance report has been formatted and emailed to **`{recip}`** via Google SMTP (`dhivakarsa10@gmail.com`)."
+                    "📖 I could not find anything in the indexed knowledge base for that question. "
+                    "An administrator can add the relevant document under **Tools & Sources → "
+                    "Documents & Knowledge Base**."
+                )
+        elif intent == "SYSTEM_INTROSPECTION":
+            scope = last_res.get("scope")
+            if scope == "capabilities":
+                matched = last_res.get("matched_tools", [])
+                total = last_res.get("total_registered_tools", 0)
+                if matched:
+                    rows = "\n".join(
+                        f"- `{t.get('name')}` ({t.get('method')}) \u2014 {t.get('description', '')[:110]}"
+                        for t in matched
+                    )
+                    response_text = (
+                        f"\U0001f527 **Matching tools ({len(matched)} of {total} registered):**"
+                        f"\n\n{rows}"
+                    )
+                else:
+                    response_text = (
+                        f"\U0001f527 None of the {total} registered tools matched that description."
+                    )
+            else:
+                logs = last_res.get("logs", [])
+                if logs:
+                    rows = "\n".join(
+                        f"- `{l.get('tool_name')}` \u2014 **{str(l.get('status', '')).upper()}** "
+                        f"({l.get('latency_ms', 0):.0f} ms) at {str(l.get('created_at', ''))[:19]}"
+                        for l in logs
+                    )
+                    response_text = f"\U0001f4dc **Recent executions:**\n\n{rows}"
+                else:
+                    response_text = "\U0001f4dc No execution history recorded yet for your account."
+        elif intent == "REPORTING":
+            # Report only what the tool returned; never substitute placeholder figures.
+            figures: Dict[str, Any] = {}
+            for trace_step in state.get("execution_trace", []):
+                payload = trace_step.get("response") or {}
+                if isinstance(payload, dict) and "total_sales_volume" in payload:
+                    figures = payload
+                    break
+
+            sales = figures.get("total_sales_volume") or {}
+            fees = figures.get("total_fee") or {}
+            sales_val = sales.get("value") if isinstance(sales, dict) else None
+            fee_val = fees.get("value") if isinstance(fees, dict) else None
+            currency = (sales.get("currency_code") if isinstance(sales, dict) else None) or "USD"
+            items_cnt = figures.get("total_items")
+
+            if sales_val is None:
+                response_text = (
+                    "\U0001f4ca The reporting tool returned no sales figures for that period."
                 )
             else:
-                response_text = (
-                    f"📊 **Monthly Sales Volume Report (Last Month):**\n\n"
-                    f"- **Total Sales Volume:** **${sales_val} {curr}**\n"
-                    f"- **Transactions Processed:** {items_cnt} payments\n"
-                    f"- **PayPal Fees:** ${fee_val} {curr}\n"
-                    f"- **Net Revenue:** **${net_val} {curr}**"
-                )
+                rows = [f"- **Total Sales Volume:** **{sales_val} {currency}**"]
+                if items_cnt is not None:
+                    rows.append(f"- **Transactions Processed:** {items_cnt}")
+                if fee_val is not None:
+                    rows.append(f"- **Processing Fees:** {fee_val} {currency}")
+                    try:
+                        net = float(str(sales_val).replace(",", "")) - float(
+                            str(fee_val).replace(",", "")
+                        )
+                        rows.append(f"- **Net Settled Revenue:** **{net:.2f} {currency}**")
+                    except (TypeError, ValueError):
+                        pass
+
+                recipient = None
+                for trace_step in state.get("execution_trace", []):
+                    if "email" in str(trace_step.get("tool_name", "")):
+                        recipient = (trace_step.get("response") or {}).get("to")
+                        break
+
+                body = "\n".join(rows)
+                response_text = f"\U0001f4ca **Sales Volume Report:**\n\n{body}"
+                if recipient:
+                    response_text += f"\n\n\U0001f4ec Emailed to **`{recipient}`**."
         elif "invoice" in str(last_res).lower():
             inv_id = last_res.get("id") or last_res.get("invoice_id", "INV-SAMPLE")
             status = last_res.get("status", "CREATED")
@@ -850,7 +1214,11 @@ async def compose_final_answer_node(state: AgentState) -> dict[str, Any]:
             is_real = last_res.get("real_smtp_delivery", False)
             if status == "SENT" or is_real:
                 delivery_header = "📬 **Invoice Issued & Real Email Dispatched via Google SMTP!**" if is_real else "📋 **Invoice Issued & Dispatched**"
-                delivery_note = f"Real outbound email delivered to `{recipient}` via Google SMTP (`dhivakarsa10@gmail.com`)." if is_real else f"Invoice record dispatched to `{recipient}`."
+                delivery_note = (
+                    f"Outbound email delivered to `{recipient}` via SMTP."
+                    if is_real
+                    else f"Invoice record dispatched to `{recipient}`."
+                )
                 response_text = (
                     f"{delivery_header}\n\n"
                     f"- **Invoice ID:** `{inv_id}`\n"
@@ -873,24 +1241,56 @@ async def compose_final_answer_node(state: AgentState) -> dict[str, Any]:
     else:
         response_text = "I have reviewed your request. Please specify which action or tool you would like me to invoke."
 
-    # Token Accounting
-    token_svc = get_token_usage_service()
-    prompt_tokens = len(state.get("user_prompt", "").split()) * 2 + 30
-    completion_tokens = len(response_text.split()) * 2 + 20
-    tokens = {
-        "input_tokens": prompt_tokens,
-        "output_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
+    return response_text
 
-    # Record token usage in database
-    await token_svc.record_token_usage(
-        request_id=state.get("request_id", ""),
-        user_id=state.get("user_id", "default_user"),
-        input_tokens=prompt_tokens,
-        output_tokens=completion_tokens,
-        model="gemini-2.5-flash",
-    )
+
+async def compose_final_answer_node(state: AgentState) -> dict[str, Any]:
+    """
+    Write the user-facing answer, grounded in the tool results, and record token usage.
+
+    Primary path: Gemini synthesis over the execution trace, which also completes the RAG
+    story (retrieved chunks are summarised and cited rather than pasted verbatim).
+
+    Fallback path: per-intent templates, used when the model is unavailable.
+    """
+    settings = get_settings()
+    tokens = dict(state.get("token_usage") or _EMPTY_TOKENS)
+    executed = _completed_step_summaries(state)
+    pending_approval = state.get("approval_status") == "pending"
+    synthesis_mode = "template"
+
+    response_text: Optional[str] = None
+    llm = get_llm_service()
+
+    # An approval pause or a clarification prompt is a control message, not an answer to
+    # synthesise: it must reach the user verbatim so the UI can render the approval card.
+    control_message = state.get("final_response") if (pending_approval or state.get("requires_clarification")) else None
+
+    if control_message:
+        response_text = control_message
+    else:
+        synthesized = await llm.synthesize_answer(
+            user_prompt=state.get("user_prompt", ""),
+            execution_results=executed,
+            history=state.get("messages", []),
+        )
+        if synthesized is not None:
+            response_text, usage = synthesized
+            tokens = _accumulate_tokens(tokens, usage.as_dict())
+            synthesis_mode = "gemini"
+
+    if not response_text:
+        response_text = _render_template_answer(state)
+
+    # Record the real token usage accumulated across this turn's model calls.
+    if tokens.get("total_tokens", 0) > 0:
+        await get_token_usage_service().record_token_usage(
+            request_id=state.get("request_id", ""),
+            user_id=state.get("user_id", "default_user"),
+            input_tokens=tokens.get("input_tokens", 0),
+            output_tokens=tokens.get("output_tokens", 0),
+            model=settings.gemini_model,
+        )
 
     timeline = list(state.get("timeline_events", []))
     timeline.append(
@@ -898,8 +1298,11 @@ async def compose_final_answer_node(state: AgentState) -> dict[str, Any]:
             "stage": "compose_final_answer",
             "status": "completed",
             "timestamp": time.time(),
-            "details": f"Answer composed with {tokens['total_tokens']} tokens accounted.",
-            "metadata": tokens,
+            "details": (
+                f"Answer composed via {synthesis_mode}; "
+                f"{tokens.get('total_tokens', 0)} model tokens consumed this turn."
+            ),
+            "metadata": {**tokens, "synthesis": synthesis_mode},
         }
     )
 

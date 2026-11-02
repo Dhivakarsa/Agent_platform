@@ -230,6 +230,9 @@ class AgentRun(Base):
     tools_used: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
     execution_trace: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
     approval_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_required")  # not_required, pending, approved, rejected
+    # The assistant's reply for this turn, so conversation history can be replayed into
+    # a later turn's context (resolving follow-ups like "send it to john@example.com").
+    final_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

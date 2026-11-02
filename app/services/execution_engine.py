@@ -33,10 +33,15 @@ class ExecutionEngine:
         arguments: dict[str, Any],
         session_id: str,
         request_id: Optional[str] = None,
+        user_id: str = "system",
+        user_role: str = "user",
     ) -> ToolCallResult:
         """
         Execute tool with parameter validation, idempotency header injection,
         sandboxed HTTP or realistic mock dispatch, and audit logging.
+
+        ``user_id`` is recorded on the audit row so per-user log isolation and the
+        administrator's per-user drilldown can filter on it.
         """
         start_time = time.perf_counter()
         req_id = request_id or str(uuid.uuid4())
@@ -61,7 +66,9 @@ class ExecutionEngine:
             if is_mcp:
                 response_payload, http_code = await self._mcp_dispatch(tool, arguments, req_id)
             elif self.settings.execution_mode == "mock" or not self.settings.paypal_client_id:
-                response_payload, http_code = await self._mock_dispatch(tool, arguments, req_id)
+                response_payload, http_code = await self._mock_dispatch(
+                    tool, arguments, req_id, user_id=user_id, user_role=user_role
+                )
             else:
                 response_payload, http_code = await self._http_dispatch(tool, arguments, req_id)
 
@@ -90,6 +97,7 @@ class ExecutionEngine:
 
         # 3. Write relational audit log
         await self._log_execution(
+            user_id=user_id,
             session_id=session_id,
             request_id=req_id,
             tool_name=tool.name,
@@ -126,6 +134,8 @@ class ExecutionEngine:
         tool: RegisteredTool,
         arguments: dict[str, Any],
         request_id: str,
+        user_id: str = "system",
+        user_role: str = "user",
     ) -> tuple[dict[str, Any], int]:
         """Produce deterministic, realistic financial responses for PayPal operations."""
         name = tool.name
@@ -164,27 +174,32 @@ class ExecutionEngine:
             from app.meta_tools.email_tool import list_email_drafts
             return list_email_drafts(), 200
 
-        if name == "search_paypal_documentation":
-            import inspect
+        if name in ("rag_pipeline_tool", "search_paypal_documentation"):
             from app.meta_tools.rag_pipeline_tool import get_rag_tool
             rag = get_rag_tool()
-            q_text = str(arguments.get("query") or arguments.get("question") or "")
-            if hasattr(rag, "query"):
-                res_val = rag.query(q_text)
-                if inspect.isawaitable(res_val):
-                    res_val = await res_val
-                return res_val, 200
-            elif hasattr(rag, "search"):
-                res_val = rag.search(q_text)
-                if inspect.isawaitable(res_val):
-                    res_val = await res_val
-                return res_val, 200
+            return await rag.query(
+                query=str(arguments.get("query") or arguments.get("question") or ""),
+                domain_filter=arguments.get("domain_filter") or None,
+            ), 200
 
-        if name == "system_catalog_search":
+        if name in ("system_search_tool", "system_catalog_search"):
             from app.meta_tools.system_search_tool import get_system_search_tool
             st = get_system_search_tool()
-            query = str(arguments.get("query") or "")
-            return st.search(query), 200
+            scope = str(arguments.get("scope") or "capabilities")
+            if scope not in ("capabilities", "execution_logs"):
+                scope = "capabilities"
+            try:
+                limit = int(arguments.get("limit") or 5)
+            except (TypeError, ValueError):
+                limit = 5
+            return await st.query(
+                scope=scope,
+                query=str(arguments.get("query") or ""),
+                limit=limit,
+                session_id=arguments.get("session_id"),
+                user_id=user_id,
+                user_role=user_role,
+            ), 200
 
         # Invoicing responses
         if "generate_invoice_number" in name or "next_invoice_number" in name:
@@ -208,7 +223,13 @@ class ExecutionEngine:
 
         if "send_invoice" in name:
             inv_id = arguments.get("invoice_id", f"INV2-{uuid.uuid4().hex[:8].upper()}")
-            recip = arguments.get("recipient_email") or arguments.get("email") or arguments.get("to") or "dhivakarsa10@hotmail.com"
+            recip = (
+                arguments.get("recipient_email")
+                or arguments.get("email")
+                or arguments.get("to")
+            )
+            if not recip:
+                raise ValueError("send_invoice requires a recipient email address")
             amt = str(arguments.get("amount", "50.00"))
             curr = str(arguments.get("currency_code", "USD"))
 
@@ -333,7 +354,7 @@ class ExecutionEngine:
             if f"{{{k}}}" in url:
                 url = url.replace(f"{{{k}}}", str(v))
 
-        async with httpx.AsyncClient(timeout=self.settings.execution_timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=self.settings.default_api_timeout) as client:
             resp = await client.request(
                 method=tool.method,
                 url=url,
@@ -370,6 +391,7 @@ class ExecutionEngine:
 
     async def _log_execution(
         self,
+        user_id: str,
         session_id: str,
         request_id: str,
         tool_name: str,
@@ -383,6 +405,7 @@ class ExecutionEngine:
         try:
             async with async_session_factory() as s:
                 entry = ExecutionLog(
+                    user_id=user_id,
                     session_id=session_id,
                     request_id=request_id,
                     tool_name=tool_name,

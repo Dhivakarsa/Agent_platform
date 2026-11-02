@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Literal, Optional
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 
 from app.db.models import ExecutionLog, ToolMetadata
 from app.db.session import async_session_factory
@@ -31,6 +31,8 @@ class SystemSearchTool:
         query: str = "",
         limit: int = 5,
         session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        user_role: str = "user",
     ) -> dict[str, Any]:
         """
         Execute introspection query:
@@ -42,7 +44,13 @@ class SystemSearchTool:
         if scope == "capabilities":
             return await self._search_capabilities(query=query, limit=limit)
         elif scope == "execution_logs":
-            return await self._search_logs(query=query, limit=limit, session_id=session_id)
+            return await self._search_logs(
+                query=query,
+                limit=limit,
+                session_id=session_id,
+                user_id=user_id,
+                user_role=user_role,
+            )
         else:
             return {"error": f"Invalid scope '{scope}'. Allowed values are 'capabilities' or 'execution_logs'."}
 
@@ -77,39 +85,63 @@ class SystemSearchTool:
         query: str,
         limit: int,
         session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        user_role: str = "user",
     ) -> dict[str, Any]:
-        """Search execution logs filtered by session or tool name."""
+        """
+        Search execution logs, scoped to the calling user unless they are an admin.
+
+        The keyword filter is applied against tool name and request id only. Callers
+        routinely pass conversational phrasing ("my last request"), so when a filter
+        matches nothing the most recent entries are returned instead of an empty list.
+        """
         async with async_session_factory() as s:
-            stmt = select(ExecutionLog).order_by(desc(ExecutionLog.id))
-            if session_id:
-                stmt = stmt.where(ExecutionLog.session_id == session_id)
+
+            def base_query():
+                stmt = select(ExecutionLog).order_by(desc(ExecutionLog.id))
+                # Normal users may only introspect their own execution history.
+                if user_role != "admin" and user_id:
+                    stmt = stmt.where(ExecutionLog.user_id == user_id)
+                if session_id:
+                    stmt = stmt.where(ExecutionLog.session_id == session_id)
+                return stmt
+
+            logs = []
+            filtered = False
             if query:
-                stmt = stmt.where(ExecutionLog.tool_name.ilike(f"%{query}%"))
-            stmt = stmt.limit(limit)
+                stmt = base_query().where(
+                    or_(
+                        ExecutionLog.tool_name.ilike(f"%{query}%"),
+                        ExecutionLog.request_id.ilike(f"%{query}%"),
+                    )
+                ).limit(limit)
+                logs = list((await s.execute(stmt)).scalars().all())
+                filtered = bool(logs)
 
-            res = await s.execute(stmt)
-            logs = res.scalars().all()
+            if not logs:
+                logs = list((await s.execute(base_query().limit(limit))).scalars().all())
 
-            results = []
-            for item in logs:
-                results.append(
-                    {
-                        "id": item.id,
-                        "request_id": item.request_id,
-                        "session_id": item.session_id,
-                        "tool_name": item.tool_name,
-                        "status": item.status,
-                        "latency_ms": item.latency_ms,
-                        "error_message": item.error_message,
-                        "created_at": str(item.created_at),
-                        "input_args": item.input_args,
-                        "response_summary": item.response_payload,
-                    }
-                )
+            results = [
+                {
+                    "id": item.id,
+                    "request_id": item.request_id,
+                    "session_id": item.session_id,
+                    "tool_name": item.tool_name,
+                    "status": item.status,
+                    "latency_ms": item.latency_ms,
+                    "error_message": item.error_message,
+                    "created_at": str(item.created_at),
+                    "input_args": item.input_args,
+                    "response_summary": item.response_payload,
+                }
+                for item in logs
+            ]
 
             return {
                 "scope": "execution_logs",
                 "query": query,
+                "keyword_filter_applied": filtered,
+                "scoped_to_user": user_id if user_role != "admin" else "all_users",
                 "count": len(results),
                 "logs": results,
             }
