@@ -173,15 +173,3 @@ python -m pytest tests/ -q
 | [`docs/assignment_report.pdf`](docs/assignment_report.pdf) | Submission report answering the task's five pointers |
 
 Regenerate them with `python build_docs.py`. [`ARCHITECTURE_AND_WORKFLOW.md`](ARCHITECTURE_AND_WORKFLOW.md) holds the same material as Mermaid diagrams.
-
----
-
-## 12. Known limitations
-
-- **The live model path is not covered by automated tests.** Planner and synthesis are tested against a stubbed SDK; running with a real key is a manual step.
-- **Embeddings fall back to a local hash when no API key is set**, so document retrieval then relies on token overlap and won't match synonyms. With `GEMINI_API_KEY` configured, the knowledge base and the tool index both use Gemini embeddings.
-- **Changing embedding provider requires a reindex.** Indexing with Gemini and later querying without a key puts the two in different vector spaces; delete and re-ingest the affected sources.
-- **Qdrant runs in memory by default**, so the tool index is rebuilt on each start.
-- **13 of 73 catalog entries carry no parameters**, being endpoints the seeded collection defines without path, query or body fields.
-- **Schema changes use ad-hoc SQLite `ALTER` statements**, not a migration tool.
-- **The deterministic fallback router recognises only its encoded intents.** A document question with no trigger word (for example "what does the Snorfle policy require" works, but a bare product name may not) can miss the RAG tool. This is a fallback-only limitation; the model-driven planner routes on meaning.
